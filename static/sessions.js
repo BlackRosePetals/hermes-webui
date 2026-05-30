@@ -361,7 +361,9 @@ function _markSessionCompletedInList(session, previousSid = null) {
   if (!session || !Array.isArray(_allSessions)) return;
   const finalSid = session.session_id || previousSid;
   if (!finalSid) return;
-  const idx = _allSessions.findIndex(s => s && (s.session_id === finalSid || s.session_id === previousSid));
+  const finalIdx = _allSessions.findIndex(s => s && s.session_id === finalSid);
+  const previousIdx = previousSid ? _allSessions.findIndex(s => s && s.session_id === previousSid) : -1;
+  const idx = finalIdx >= 0 ? finalIdx : previousIdx;
   if (idx < 0) return;
   const {messages: _messages, tool_calls: _toolCalls, ...sessionMeta} = session;
   const messageCount = Number(
@@ -384,6 +386,11 @@ function _markSessionCompletedInList(session, previousSid = null) {
   _sessionStreamingById.set(finalSid, false);
   _forgetObservedStreamingSession(finalSid);
   if (previousSid && previousSid !== finalSid) {
+    for (let i = _allSessions.length - 1; i >= 0; i--) {
+      if (i !== idx && _allSessions[i] && _allSessions[i].session_id === previousSid) {
+        _allSessions.splice(i, 1);
+      }
+    }
     _sessionStreamingById.delete(previousSid);
     _forgetObservedStreamingSession(previousSid);
     _sessionListSnapshotById.delete(previousSid);

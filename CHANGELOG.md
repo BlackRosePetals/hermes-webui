@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+## [v0.51.462] — 2026-06-16 — Release PW (sidebar survives slow loads)
+
+### Fixed
+
+- **The conversation sidebar no longer vanishes during slow or resilient session loads (#4167).** A slow `/api/sessions` response could leave the sidebar empty; it now keeps the list visible and shows a retryable error state (with an opt-in request retry) instead of blanking out. Read-only sessions (imported CLI and Claude Code sessions) correctly keep their rename/action-menu/swipe suppression and the detailed gateway model label renders, both of which had been dropped from the sidebar payload. And when a refresh fails right after switching profiles, the sidebar shows the error state rather than briefly re-rendering the previous profile's conversations. Thanks @ai-ag2026.
+
 ## [v0.51.461] — 2026-06-16 — Release PV (custom-provider keys recognized from the pool)
 
 ### Fixed

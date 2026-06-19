@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+## [v0.51.518] — 2026-06-19 — Release SC (read-only memory writes report 403, not 500)
+
+### Fixed
+
+- **Writing to a read-only memory file now returns an actionable 403 instead of an opaque 500 (#4480).** On a fresh two-container install, `SOUL.md` can land mode `0444` (or on a read-only mounted volume), so saving from the Memory tab raised a `PermissionError`/`EROFS` that bubbled up as a generic 500. `/api/memory/write` now catches those two cases and returns a 403 naming the file, its mode, and a `chmod 644` / fix-ownership hint; any other `OSError` is still re-raised unchanged, and the existing symlinked-target guard is preserved. Thanks @franksong2702.
+
 ## [v0.51.517] — 2026-06-19 — Release SB (multi-container gateway URL config)
 
 ### Fixed

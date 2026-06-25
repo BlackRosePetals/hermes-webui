@@ -1825,8 +1825,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const normalized=String(text||'').replace(/\s+/g,' ').trim();
     if(!normalized) return false;
     const systemRecovery=/^\[System:/i.test(normalized)
-      && /previous response was cut off by a network error/i.test(normalized)
-      && /continue exactly where you left off/i.test(normalized);
+      && (/continue exactly where you left off/i.test(normalized)
+        || /do not retry the same tool call/i.test(normalized));
     const backendRecovery=/^the live worker stopped before this run finished\.?$/i.test(normalized);
     return !!(systemRecovery || backendRecovery);
   }

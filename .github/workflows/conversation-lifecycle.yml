@@ -1,4 +1,4 @@
-name: Conversation lifecycle (informational)
+name: Conversation lifecycle
 
 # Scoped to the code this browser gate actually exercises — the chat
 # render/streaming surface — so it doesn't spin up playwright+chromium on
@@ -17,6 +17,9 @@ on:
       - 'tests/browser_reconnect_scene_redraw.py'
       - 'tests/browser_settle_visibility_7676.py'
       - 'tests/browser_approval_first_click.py'
+      - 'tests/browser_live_scene_energy.py'
+      - 'tests/browser_progress_animation.py'
+      - 'tests/browser_transparent_fade_mutations.py'
       - 'requirements*.txt'
       - 'pyproject.toml'
       - '.github/workflows/conversation-lifecycle.yml'
@@ -32,6 +35,9 @@ on:
       - 'tests/browser_reconnect_scene_redraw.py'
       - 'tests/browser_settle_visibility_7676.py'
       - 'tests/browser_approval_first_click.py'
+      - 'tests/browser_live_scene_energy.py'
+      - 'tests/browser_progress_animation.py'
+      - 'tests/browser_transparent_fade_mutations.py'
       - 'requirements*.txt'
       - 'pyproject.toml'
       - '.github/workflows/conversation-lifecycle.yml'
@@ -77,6 +83,15 @@ jobs:
           # regression land green.
           - name: approval-first-click
             script: tests/browser_approval_first_click.py
+          - name: live-scene-energy
+            script: tests/browser_live_scene_energy.py
+            browsers: chromium
+          - name: progress-animation
+            script: tests/browser_progress_animation.py
+            browsers: chromium
+          - name: transparent-fade-mutations
+            script: tests/browser_transparent_fade_mutations.py
+            browsers: chromium
     steps:
       - uses: actions/checkout@v4
 

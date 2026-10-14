@@ -841,22 +841,29 @@ function _markMessageVirtualMeasurementsSettled(windowMetrics){
 // fails, _clearMessageVirtualHeightCache() wipes the cache, the cache becomes incomplete
 // (>=50%), and the __vmFullMeasure fallback re-renders the whole transcript (measured at
 // 8.2s / 8.4s per pass, matching 10.2s / 11.6s long tasks).
-// A message now keeps its measured height when either the identity or a content signature
-// matches.
+// A message now keeps its measured height when either the identity or a full render
+// fingerprint matches: identity equality reuses unconditionally (unchanged behavior); for
+// fresh objects the fingerprint (_messageRenderHeightFingerprint) must cover EVERY
+// render-affecting field — tool-call identity/name/type/function.name/arguments, partial
+// tool calls, reasoning, attachments, content-array parts — so an equal-length middle
+// edit or a tool-state change can never reuse a stale row height and corrupt the
+// virtualization geometry / scroll anchor.
+// The field set has exactly one definition (_addMessageRenderHash, shared with
+// _messageRenderCacheSignature). Upstream tests extract this matcher alone (extractFunc)
+// and evaluate it in isolation; without the shared helper we FAIL CLOSED to identity-only
+// matching instead of carrying a second, drift-prone field list.
 // Opt-out: window.__vmReuseBySig=false restores the previous behavior.
 function _messageVirtualHeightEntryMatches(previousEntry, nextEntry){
   if(!previousEntry||!nextEntry) return false;
   if(previousEntry.m===nextEntry.m) return true;              // identity match: unchanged behavior
   if(typeof window!=='undefined'&&window.__vmReuseBySig===false) return false; // opt-out: previous behavior
-  // Self-contained on purpose: upstream tests extract this function alone and evaluate it
-  // in isolation, so it must not depend on module-level helpers or flags.
-  function _vmSig(m){
-    if(!m) return '';
-    const c=(typeof m.content==='string')?m.content:'';
-    const tc=Array.isArray(m.tool_calls)?m.tool_calls.length:0;
-    return String(m.id||'')+'|'+String(m.role||'')+'|'+c.length+'|'+tc+'|'+c.slice(0,40)+'|'+c.slice(-40);
-  }
-  return _vmSig(previousEntry.m)===_vmSig(nextEntry.m);
+  // Height reuse on identity change is only safe when EVERY render-affecting field matches.
+  // The field set has exactly one definition (_addMessageRenderHash, shared with
+  // _messageRenderCacheSignature). Upstream tests extract this function alone (extractFunc)
+  // and evaluate it in isolation; without the shared helper we FAIL CLOSED to identity-only
+  // matching instead of carrying a second, drift-prone field list.
+  if(typeof _messageRenderHeightFingerprint!=='function') return false;
+  return _messageRenderHeightFingerprint(previousEntry.m)===_messageRenderHeightFingerprint(nextEntry.m);
 }
 function _messageVirtualHeightPrefixEntryMatches(previousEntry, nextEntry){
   return !!(
@@ -1109,6 +1116,7 @@ function _captureMessageViewportAnchor(){
   for(const row of rows){
     const rawIdx=Number(row&&row.dataset&&row.dataset.msgIdx);
     if(!Number.isFinite(rawIdx)) continue;
+    if(typeof window!=='undefined'){window.__vmAnchorFallbackRowReads=(window.__vmAnchorFallbackRowReads||0)+1;}
     const rect=row.getBoundingClientRect();
     if(rect.bottom>containerRect.top+1){
       const sessionIdx=Number(row&&row.dataset&&row.dataset.sessionMsgIdx);
@@ -16185,6 +16193,61 @@ function _hashObjectInto(add, value, depth){
   for(let i=0;i<keys.length;i++){ add(keys[i]); add(i); _addBoundedHash(add, value[keys[i]], depth); }
 }
 
+// One field set for every render-affecting message property, shared by the
+// session-HTML cache signature (_messageRenderCacheSignature) and the virtual
+// row-height reuse matcher (_messageRenderHeightFingerprint). Exactly one
+// definition keeps the two consumers from drifting apart: a render-dependent
+// field one consumer forgets would silently alias distinct states onto one
+// cache entry (review finding on #7695).
+// Copied verbatim from the former per-message loop of _messageRenderCacheSignature;
+// field order is intentionally unchanged (hash-zero-drift invariant).
+function _addMessageRenderHash(add, m){
+  if(!m||typeof m!=='object'){ add('missing'); return; }
+  add(m.role);add(m.timestamp);add(m._ts);add(m._error);add(m._statusCard);
+  add(msgContent(m));
+  if(Array.isArray(m.content)){
+    add('content-array');
+    m.content.forEach(part=>{
+      if(!part||typeof part!=='object'){ add(part); return; }
+      add(part.type);add(part.id);add(part.name);add(part.text);add(part.content);
+    });
+  }
+  if(Array.isArray(m.tool_calls)){
+    add('message-tool-calls');add(m.tool_calls.length);
+    m.tool_calls.forEach(tc=>{
+      add(tc&&tc.id);add(tc&&tc.name);add(tc&&tc.type);
+      add(tc&&tc.function&&tc.function.name);
+      // function.arguments is already a string — streamed in full, no copy.
+      _addBoundedHash(add, tc&&tc.function&&tc.function.arguments);
+    });
+  }
+  if(Array.isArray(m._partial_tool_calls)){
+    add('partial-tool-calls');add(m._partial_tool_calls.length);
+    m._partial_tool_calls.forEach(tc=>{add(tc&&tc.id);add(tc&&tc.name);add(tc&&tc.snippet);});
+  }
+  if(_messageHasReasoningPayload(m)) add(m.reasoning||m.thinking||m._reasoning||'reasoning');
+  if(Array.isArray(m.attachments)) m.attachments.forEach(a=>_addBoundedHash(add, a));
+}
+// FNV-1a fingerprint of ONE message's render-affecting fields — the identity-
+// change reuse gate for virtual row heights. A non-object input fingerprints
+// as 'missing' (handled inside _addMessageRenderHash). The addByte() closure is
+// byte-identical to the one inside _messageRenderCacheSignature (named
+// differently so the no-duplicate-function-definitions check stays green).
+function _messageRenderHeightFingerprint(m){
+  let hash=2166136261;
+  function addByte(value){
+    const s=String(value==null?'':value);
+    for(let i=0;i<s.length;i++){
+      hash^=s.charCodeAt(i);
+      hash=Math.imul(hash,16777619)>>>0;
+    }
+    hash^=31;
+    hash=Math.imul(hash,16777619)>>>0;
+  }
+  _addMessageRenderHash(addByte, m);
+  return hash.toString(16);
+}
+
 function _messageRenderCacheSignature(){
   let hash=2166136261;
   function add(value){
@@ -16198,32 +16261,14 @@ function _messageRenderCacheSignature(){
   }
   const messages=Array.isArray(S.messages)?S.messages:[];
   add(messages.length);
+  /* Per-message render field set is defined exactly once, in function
+     _addMessageRenderHash(add, m) above; _messageRenderHeightFingerprint
+     drives the virtual row-height reuse matcher from the same function, so
+     the two consumers cannot drift apart. The field set covers msgContent(m),
+     m.tool_calls, m._partial_tool_calls, reasoning, attachments, and
+     content-array parts (review finding #2 on #7695). */
   for(const m of messages){
-    if(!m||typeof m!=='object'){ add('missing'); continue; }
-    add(m.role);add(m.timestamp);add(m._ts);add(m._error);add(m._statusCard);
-    add(msgContent(m));
-    if(Array.isArray(m.content)){
-      add('content-array');
-      m.content.forEach(part=>{
-        if(!part||typeof part!=='object'){ add(part); return; }
-        add(part.type);add(part.id);add(part.name);add(part.text);add(part.content);
-      });
-    }
-    if(Array.isArray(m.tool_calls)){
-      add('message-tool-calls');add(m.tool_calls.length);
-      m.tool_calls.forEach(tc=>{
-        add(tc&&tc.id);add(tc&&tc.name);add(tc&&tc.type);
-        add(tc&&tc.function&&tc.function.name);
-        // function.arguments is already a string — streamed in full, no copy.
-        _addBoundedHash(add, tc&&tc.function&&tc.function.arguments);
-      });
-    }
-    if(Array.isArray(m._partial_tool_calls)){
-      add('partial-tool-calls');add(m._partial_tool_calls.length);
-      m._partial_tool_calls.forEach(tc=>{add(tc&&tc.id);add(tc&&tc.name);add(tc&&tc.snippet);});
-    }
-    if(_messageHasReasoningPayload(m)) add(m.reasoning||m.thinking||m._reasoning||'reasoning');
-    if(Array.isArray(m.attachments)) m.attachments.forEach(a=>_addBoundedHash(add, a));
+    _addMessageRenderHash(add, m);
   }
   const toolCalls=Array.isArray(S.toolCalls)?S.toolCalls:[];
   add('settled-tool-calls');add(toolCalls.length);

@@ -132,3 +132,7 @@ jobs:
       - name: Run approval Enter-shortcut gate
         if: needs.changes.outputs.docs_only != 'true'
         run: python tests/browser_approval_enter_shortcut.py
+
+      - name: Run terminal screen-reader-mode gate
+        if: needs.changes.outputs.docs_only != 'true'
+        run: python tests/browser_terminal_screen_reader_mode.py

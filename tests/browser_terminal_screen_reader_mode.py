@@ -31,6 +31,7 @@ SCOPE
 
 USAGE
   python tests/browser_terminal_screen_reader_mode.py
+  (TERMINAL_SR_MODE_PORT pins the port; by default a free one is picked.)
   (Requires: playwright + chromium; firefox is used when installed.)
 
 EXIT CODES
@@ -39,6 +40,7 @@ EXIT CODES
   2 — environment/setup failure (server didn't boot, playwright missing, etc.)
 """
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -46,7 +48,14 @@ import time
 import urllib.error
 import urllib.request
 
-PORT = int(os.getenv("TERMINAL_SR_MODE_PORT", "8800"))
+
+def _free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+PORT = int(os.getenv("TERMINAL_SR_MODE_PORT") or _free_port())
 BASE = f"http://127.0.0.1:{PORT}"
 MARKER = "sr-mode-marker-42"
 
@@ -55,9 +64,12 @@ class _SetupError(Exception):
     """The environment, not the product, kept the gate from running."""
 
 
-def _wait_for_health(timeout=30):
+def _wait_for_health(proc, timeout=30):
     deadline = time.time() + timeout
     while time.time() < deadline:
+        # A child that exited cannot be the server answering /health.
+        if proc.poll() is not None:
+            return False
         try:
             with urllib.request.urlopen(BASE + "/health", timeout=2) as r:
                 if r.status == 200:
@@ -196,6 +208,14 @@ def main():
         print("SKIP: playwright not installed", file=sys.stderr)
         return 2
 
+    # A server already listening on PORT would answer /health and the checks would
+    # silently run against ITS code and state, not this checkout's. Refuse instead.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.5)
+        if probe.connect_ex(("127.0.0.1", PORT)) == 0:
+            print(f"SETUP FAIL: port {PORT} is already in use; pick another TERMINAL_SR_MODE_PORT or unset it", file=sys.stderr)
+            return 2
+
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     server_py = os.path.join(repo_root, "server.py")
     state_dir = tempfile.mkdtemp(prefix="hermes-terminal-sr-mode-")
@@ -223,8 +243,8 @@ def main():
         **({"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}),
     )
     try:
-        if not _wait_for_health(timeout=30):
-            print("SETUP FAIL: server did not become healthy in 30s", file=sys.stderr)
+        if not _wait_for_health(proc, timeout=30):
+            print("SETUP FAIL: server exited or did not become healthy in 30s", file=sys.stderr)
             log.flush()
             with open(os.path.join(state_dir, "server.log")) as f:
                 print(f.read()[-2000:], file=sys.stderr)

@@ -11136,7 +11136,6 @@ const LOCALES = {
     usage_settings_tip: 'Hinweis: Kostenschätzungen sind ungefähr.',
     usage_total: 'Tokens gesamt',
     usage_unknown: 'unbekannt',
-    workspace_artifact_source_session: 'Sitzung',
   },
 
   zh: {

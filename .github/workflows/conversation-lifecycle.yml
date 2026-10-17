@@ -19,6 +19,7 @@ on:
       - 'tests/browser_approval_first_click.py'
       - 'tests/browser_live_scene_energy.py'
       - 'tests/browser_progress_animation.py'
+      - 'tests/browser_running_ring_inset.py'
       - 'requirements*.txt'
       - 'pyproject.toml'
       - '.github/workflows/conversation-lifecycle.yml'
@@ -36,6 +37,7 @@ on:
       - 'tests/browser_approval_first_click.py'
       - 'tests/browser_live_scene_energy.py'
       - 'tests/browser_progress_animation.py'
+      - 'tests/browser_running_ring_inset.py'
       - 'tests/browser_transparent_fade_mutations.py'
       - 'requirements*.txt'
       - 'pyproject.toml'
@@ -87,6 +89,9 @@ jobs:
             browsers: chromium
           - name: progress-animation
             script: tests/browser_progress_animation.py
+            browsers: chromium
+          - name: running-ring-inset
+            script: tests/browser_running_ring_inset.py
             browsers: chromium
     steps:
       - uses: actions/checkout@v4

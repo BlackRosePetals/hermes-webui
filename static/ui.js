@@ -836,44 +836,33 @@ function _markMessageVirtualMeasurementsSettled(windowMetrics){
   _messageVirtualMeasurementCycleKey=_messageVirtualMeasurementCycleKeyFor(windowMetrics);
   _resetMessageVirtualMeasurementBurst();
 }
-// The previous predicate compared object identity only. After loadSession(force:true) replaces
-// S.messages with fresh objects, identities never match, so prefix/suffix migration always
-// fails, _clearMessageVirtualHeightCache() wipes the cache, the cache becomes incomplete
-// (>=50%), and the full-transcript re-measure that follows re-renders every row (measured at
-// 8.2s / 8.4s per pass, matching 10.2s / 11.6s long tasks).
-// A message now keeps its measured height when either the identity or the render fingerprints
-// match: identity equality reuses unconditionally (unchanged behavior); for fresh objects two
-// checks must both pass —
-//   1. _messageRenderHeightFingerprint: a deep hash of the ENTIRE message object, so an
-//      equal-length middle edit, a reasoning_content-only change, a _statusCard or
-//      activity-scene update — any render-field change — can never reuse a stale height;
-//   2. _messageToolRenderDigest: the cross-message tool render data (role:'tool' results
-//      joined by tool_call_id, settled S.toolCalls, persisted snippets) that renders inside
-//      the row but lives on other messages, invisible to the message fingerprint (review
-//      finding on #8228: a tool-result-only change must invalidate the row).
-// Computed fingerprints are cached on the entries (_rfp / _th), so a sync pass never hashes
-// the same message twice; _th is sealed at sync time (see _syncMessageVirtualHeightCache)
-// because it must reflect the tool state the height was measured against, not the refreshed
-// state. Upstream tests extract this matcher alone (extractFunc) and evaluate it in
-// isolation; without the shared helpers we FAIL CLOSED to identity-only matching instead of
-// carrying a second, drift-prone field list.
-// Opt-out: window.__vmReuseBySig=false restores the previous behavior.
+// Identity-only height reuse — the #8228 re-review (2026-10-15) found the
+// fingerprint/digest reuse machinery structurally broken on tool transcripts
+// and costly on every append, and explicitly accepted restoring identity-only
+// matching:
+//   - The tool digest was sealed inside _syncMessageVirtualHeightCache, which
+//     renderMessages calls BEFORE it derives the settled S.toolCalls list. The
+//     first seal hashed settled:null; every later seal hashed the derived item
+//     (carrying assistant_msg_idx / done), so the two never matched — one
+//     mismatching row defeated the all-or-nothing reuse: on a virtualized tool
+//     transcript 0 of 189 heights were kept, and 0 via loadSession(force).
+//   - Sealing ran on every length-change sync even with virtualization off: a
+//     3.6 MB tool-output session paid ~63 ms median per appended message.
+//   - The cached _rfp inverted matching after an in-place mutation: a fresh
+//     object equal to the pre-mutation content was refused, while one equal to
+//     the current (mutated) content reused the height measured for the old
+//     content.
+// Identity-only matching is the pre-PR baseline and is safe in both directions:
+// in-session appends keep the same message objects, so their measured heights
+// carry over; loadSession(force) replaces S.messages with fresh objects, so
+// those rows are re-measured instead of reusing a possibly-stale height (the
+// conservative direction — this is what the review's [SILENT] width/font-size
+// point refers to: identity-only discards rather than risk a wrong height).
 function _messageVirtualHeightEntryMatches(previousEntry, nextEntry){
-  if(!previousEntry||!nextEntry) return false;
-  if(previousEntry.m===nextEntry.m) return true;              // identity match: unchanged behavior
-  if(typeof window!=='undefined'&&window.__vmReuseBySig===false) return false; // opt-out: previous behavior
-  // (1) Full message render surface.
-  if(typeof _messageRenderHeightFingerprint!=='function') return false;
-  if(typeof previousEntry._rfp!=='string') previousEntry._rfp=_messageRenderHeightFingerprint(previousEntry.m);
-  if(typeof nextEntry._rfp!=='string') nextEntry._rfp=_messageRenderHeightFingerprint(nextEntry.m);
-  if(previousEntry._rfp!==nextEntry._rfp) return false;
-  // (2) Cross-message tool render data. Entries sealed by _syncMessageVirtualHeightCache carry
-  // the digest of the tool state their height belongs to; hand-built fixtures (and the
-  // one-time upgrade transition) fall back to the live state.
-  if(typeof _messageToolRenderDigest!=='function') return false;
-  if(typeof previousEntry._th!=='string') previousEntry._th=_messageToolRenderDigest(previousEntry.m);
-  if(typeof nextEntry._th!=='string') nextEntry._th=_messageToolRenderDigest(nextEntry.m);
-  return previousEntry._th===nextEntry._th;
+  return !!(
+    previousEntry&&nextEntry&&
+    previousEntry.m===nextEntry.m
+  );
 }
 function _messageVirtualHeightPrefixEntryMatches(previousEntry, nextEntry){
   return !!(
@@ -889,26 +878,19 @@ function _syncMessageVirtualHeightCache(visWithIdx){
     _messageVirtualHeightCacheSrc===S.messages &&
     _messageVirtualHeightCacheEntries.length===_entryCount
   ) return;
-  // Build the next-entry view only AFTER the early-return above: sealing the
-  // tool digest (below) walks the session's tool data, and this function runs
-  // on every render / scroll window recompute — paying that walk on no-op
-  // syncs would be pure waste. (nextEntries.length equals visWithIdx.length
-  // for both arrays and non-arrays, so the check above is equivalent to the
-  // former nextEntries.length test.)
-  const _toolIndex=(typeof _messageToolRenderIndex==='function')?_messageToolRenderIndex():null;
+  // Build the next-entry view only AFTER the early-return above: this function
+  // runs on every render / scroll window recompute, so the no-op check keeps a
+  // steady-state scroll from paying the O(messages) entry build. (nextEntries
+  // length equals visWithIdx length for both arrays and non-arrays, so the
+  // check above is equivalent to the former nextEntries.length test.)
+  // Entries carry the identity only: the #8228 re-review accepted dropping the
+  // sealed tool digest — it was computed before renderMessages derived
+  // S.toolCalls, so the settled state never matched across passes (0/189
+  // heights kept on a virtualized tool transcript) and the per-append walk
+  // cost ~63 ms on large tool sessions. Reuse is decided by message-object
+  // identity alone (see _messageVirtualHeightEntryMatches).
   const nextEntries=Array.isArray(visWithIdx)
-    ? visWithIdx.map(entry=>{
-        if(!entry) return entry;
-        const sealed={rawIdx:entry.rawIdx,m:entry.m};
-        // Seal the tool state this entry's height belongs to while the
-        // pre-refresh tool data is still on S. Computing the digest later
-        // (after loadSession replaced the data) would read the refreshed
-        // state and miss a tool-result-only change (review finding on #8228).
-        if(_toolIndex&&typeof _messageToolRenderDigest==='function'){
-          sealed._th=_messageToolRenderDigest(entry.m,_toolIndex);
-        }
-        return sealed;
-      })
+    ? visWithIdx.map(entry=>entry?{rawIdx:entry.rawIdx,m:entry.m}:entry)
     : [];
   const previousEntries=Array.isArray(_messageVirtualHeightCacheEntries)?_messageVirtualHeightCacheEntries:[];
   const previousHeights=Array.isArray(_messageVirtualHeightCache)?_messageVirtualHeightCache.slice():[];
@@ -1107,7 +1089,19 @@ function _captureMessageViewportAnchor(){
   try{
     const _fast=(typeof window==='undefined')||window.__vmFastAnchor!==false;
     if(_fast){
-      const rows=container.querySelectorAll('[data-msg-idx]');
+      // #8228 CORE: search ONLY the rows that actually lay out. In the default
+      // compact_worklog mode every tool-call assistant message also renders a
+      // hidden `assistant-segment-worklog-source` row (display:none!important —
+      // style.css) that still carries data-msg-idx, and `assistant-segment-anchor`
+      // rows are display:none too. A hidden row's rect is all zeros, so bottom
+      // edges across the FULL [data-msg-idx] set are no longer monotonic and
+      // the binary search lands arbitrarily far from the true anchor
+      // (reproduced in real Chromium: row 539 / 88,424 px below the container
+      // top instead of row 15; mobile virtualization anchored row 127 instead
+      // of visible row 75). Excluding the two hidden classes restores
+      // monotonicity; the fallback scan below uses the SAME predicate so fast
+      // and slow can never disagree about which rows are candidates.
+      const rows=container.querySelectorAll('[data-msg-idx]:not(.assistant-segment-worklog-source):not(.assistant-segment-anchor)');
       const rowCount=rows?rows.length:0;
       if(rowCount){
         // First row with bottom > containerRect.top + 1 — the exact predicate
@@ -1120,30 +1114,38 @@ function _captureMessageViewportAnchor(){
           else { lo=mid+1; }
         }
         if(hit>=0){
-          const row=rows[hit];
-          const rawIdx=Number(row&&row.dataset&&row.dataset.msgIdx);
-          if(Number.isFinite(rawIdx)){
-            // Re-read the HIT row's rect: the search probed midpoints, and
-            // topOffset must describe the returned row itself.
-            const rect=row.getBoundingClientRect();
-            const sessionIdx=Number(row&&row.dataset&&row.dataset.sessionMsgIdx);
-            const spacer=container.querySelector('[data-virtual-spacer="before"]');
-            const topPadBefore=spacer?parseFloat(spacer.style.height||'0')||0:0;
-            return {
-              rawIdx,
-              sessionIdx:Number.isFinite(sessionIdx)?sessionIdx:_messageSessionIndexForRawIdx(rawIdx),
-              key:row&&row.dataset?String(row.dataset.messageAnchorKey||''):'',
-              topOffset:rect.top-containerRect.top,
-              topPadBefore,
-              scrollHeightAtCapture:container.scrollHeight,
-              inputGeneration:typeof _messageScrollInputGeneration==='number' ? _messageScrollInputGeneration : 0,
-            };
+          // The binary search assumes laid-out row bottoms are monotonic; the
+          // :not() query restores that for the two display:none classes. As a
+          // defense in depth, if the nearest laid-out previous row ALSO crosses
+          // the container's top edge the hit is not provably the first covering
+          // row, so fall back to the per-row scan below.
+          const predOk=(hit===0)||!(rows[hit-1].getBoundingClientRect().bottom>containerRect.top+1);
+          if(predOk){
+            const row=rows[hit];
+            const rawIdx=Number(row&&row.dataset&&row.dataset.msgIdx);
+            if(Number.isFinite(rawIdx)){
+              // Re-read the HIT row's rect: the search probed midpoints, and
+              // topOffset must describe the returned row itself.
+              const rect=row.getBoundingClientRect();
+              const sessionIdx=Number(row&&row.dataset&&row.dataset.sessionMsgIdx);
+              const spacer=container.querySelector('[data-virtual-spacer="before"]');
+              const topPadBefore=spacer?parseFloat(spacer.style.height||'0')||0:0;
+              return {
+                rawIdx,
+                sessionIdx:Number.isFinite(sessionIdx)?sessionIdx:_messageSessionIndexForRawIdx(rawIdx),
+                key:row&&row.dataset?String(row.dataset.messageAnchorKey||''):'',
+                topOffset:rect.top-containerRect.top,
+                topPadBefore,
+                scrollHeightAtCapture:container.scrollHeight,
+                inputGeneration:typeof _messageScrollInputGeneration==='number' ? _messageScrollInputGeneration : 0,
+              };
+            }
           }
         }
       }
     }
   }catch(_e){ /* fast path failed: fall back silently to the original per-row path */ }
-  const rows=Array.from(container.querySelectorAll('[data-msg-idx]'));
+  const rows=Array.from(container.querySelectorAll('[data-msg-idx]:not(.assistant-segment-worklog-source):not(.assistant-segment-anchor)'));
   for(const row of rows){
     const rawIdx=Number(row&&row.dataset&&row.dataset.msgIdx);
     if(!Number.isFinite(rawIdx)) continue;
@@ -16224,156 +16226,24 @@ function _hashObjectInto(add, value, depth){
   for(let i=0;i<keys.length;i++){ add(keys[i]); add(i); _addBoundedHash(add, value[keys[i]], depth); }
 }
 
-// One definition for every render-affecting message property, shared by the
-// session-HTML cache signature (_messageRenderCacheSignature) and the virtual
-// row-height reuse matcher (_messageRenderHeightFingerprint). Exactly one
-// definition keeps the two consumers from drifting apart.
+// One definition for every render-affecting message property, feeding the
+// session-HTML cache signature (_messageRenderCacheSignature).
 //
 // The former implementation hand-listed fields, and the #8228 review found the
 // list had drifted: `reasoning_content` (the field the row renderer reads
 // FIRST — see _assistantReasoningPayloadText) was never hashed, `_statusCard`
 // stringified to "[object Object]", `_anchor_activity_scene` and the
 // partial-tool argument payloads were missing, and joined tool results were
-// invisible entirely (they live on other messages — covered separately by
-// _messageToolRenderDigest). A hand list can always drift again the moment
-// the row renderer learns a new field, so this now deep-hashes the ENTIRE
-// message object: every key, array element and nested object, insertion-ordered,
-// through the same bounded, cycle-safe walk (_hashObjectInto) the signature
-// already used for structured payloads. Over-coverage only costs a redundant
-// re-measure; under-coverage keeps a stale row height and corrupts the
-// virtualization geometry, so the conservative direction is deliberate.
+// invisible entirely (they live on other messages). A hand list can always
+// drift again the moment the row renderer learns a new field, so this now
+// deep-hashes the ENTIRE message object: every key, array element and nested
+// object, insertion-ordered, through the same bounded, cycle-safe walk
+// (_hashObjectInto) the signature already used for structured payloads.
+// Over-coverage only costs a redundant re-render; under-coverage serves stale
+// HTML from the session cache, so the conservative direction is deliberate.
 function _addMessageRenderHash(add, m){
   if(!m||typeof m!=='object'){ add('missing'); return; }
   _addBoundedHash(add, m);
-}
-// FNV-1a fingerprint of ONE message's full render surface — the identity-change
-// reuse gate for virtual row heights. The hash covers the ENTIRE message
-// object (see _addMessageRenderHash); cross-message tool results are compared
-// separately via _messageToolRenderDigest, so every render input the row
-// consumes is covered by the pair. A non-object input fingerprints as
-// 'missing' (handled inside _addMessageRenderHash). The addDigestByte-style
-// closure is kept byte-identical to the addByte closure inside
-// _messageRenderCacheSignature, with a distinct name so the
-// no-duplicate-function-definitions check stays green.
-function _messageRenderHeightFingerprint(m){
-  let hash=2166136261;
-  function addByte(value){
-    const s=String(value==null?'':value);
-    for(let i=0;i<s.length;i++){
-      hash^=s.charCodeAt(i);
-      hash=Math.imul(hash,16777619)>>>0;
-    }
-    hash^=31;
-    hash=Math.imul(hash,16777619)>>>0;
-  }
-  _addMessageRenderHash(addByte, m);
-  return hash.toString(16);
-}
-// Build the cross-message tool render index for the CURRENT session state:
-// tool_call_id -> raw result bodies (from role:'tool' messages and Anthropic
-// tool_result content parts), plus the settled S.toolCalls item and the
-// persisted session.tool_calls item per id — the data sources the row
-// renderer joins into assistant rows. One build serves a whole sync pass so a
-// long transcript pays the O(messages) walk once, not once per message.
-function _messageToolRenderIndex(){
-  const idx={byTid:new Map(), settled:new Map(), persisted:new Map()};
-  try{
-    const s=(typeof S!=='undefined'&&S)?S:null;
-    const messages=(s&&Array.isArray(s.messages))?s.messages:[];
-    for(const m of messages){
-      if(!m||typeof m!=='object') continue;
-      if(m.role==='tool'){
-        const tid=String(m.tool_call_id||m.tool_use_id||'');
-        if(tid){
-          let arr=idx.byTid.get(tid);
-          if(!arr){ arr=[]; idx.byTid.set(tid, arr); }
-          arr.push(m.content);
-        }
-        continue;
-      }
-      if(Array.isArray(m.content)){
-        for(const p of m.content){
-          if(!p||typeof p!=='object'||p.type!=='tool_result') continue;
-          const tid=String(p.tool_use_id||'');
-          if(!tid) continue;
-          let arr=idx.byTid.get(tid);
-          if(!arr){ arr=[]; idx.byTid.set(tid, arr); }
-          arr.push(p.content);
-        }
-      }
-    }
-    const settled=(s&&Array.isArray(s.toolCalls))?s.toolCalls:[];
-    for(const tc of settled){
-      if(!tc||typeof tc!=='object') continue;
-      const tid=String(tc.tid||tc.id||tc.tool_call_id||tc.tool_use_id||tc.call_id||'');
-      if(tid&&!idx.settled.has(tid)) idx.settled.set(tid, tc);
-    }
-    const persisted=(s&&s.session&&Array.isArray(s.session.tool_calls))?s.session.tool_calls:[];
-    for(const tc of persisted){
-      if(!tc||typeof tc!=='object') continue;
-      const tid=String(tc.tid||tc.id||tc.tool_call_id||tc.call_id||'');
-      if(tid&&!idx.persisted.has(tid)) idx.persisted.set(tid, tc);
-    }
-  }catch(_e){}
-  return idx;
-}
-// Digest of the tool render data a message's row joins in from OTHER messages.
-// Tool results arrive as separate role:'tool' messages (joined by tool_call_id),
-// settled metadata lives on S.toolCalls, and cold reloads read persisted
-// session.tool_calls snippets — none of it is on the message object, so the
-// message fingerprint cannot see a tool-only change. The #8228 review caught
-// exactly that: a stale row height was reused when ONLY a tool result changed
-// between refreshes. Bodies go through _addBoundedHash IN FULL (never clipped),
-// so a middle-only edit can never alias. Deterministic for identical inputs;
-// empty string when the message references no tool calls.
-function _messageToolRenderDigest(m, index){
-  // Fail closed on an uncomputable digest: a unique per-call token means two
-  // unverifiable states never compare equal, so the row is re-measured
-  // instead of reusing a possibly-stale height.
-  const failClosed=()=>'th-err-'+(Math.random());
-  try{
-    if(!m||typeof m!=='object') return '';
-    const seen={};
-    const ids=[];
-    const pushId=value=>{
-      const tid=String(value==null?'':value);
-      if(!tid||seen[tid]) return;
-      seen[tid]=1;
-      ids.push(tid);
-    };
-    if(Array.isArray(m.tool_calls)) m.tool_calls.forEach(tc=>{
-      if(tc&&typeof tc==='object') pushId(tc.tid||tc.id||tc.tool_call_id||tc.tool_use_id||tc.call_id);
-    });
-    if(Array.isArray(m.content)) m.content.forEach(p=>{
-      if(p&&typeof p==='object'&&p.type==='tool_use') pushId(p.id||p.tool_use_id);
-    });
-    if(Array.isArray(m._partial_tool_calls)) m._partial_tool_calls.forEach(tc=>{
-      if(tc&&typeof tc==='object') pushId(tc.tid||tc.id||tc.tool_call_id||tc.call_id);
-    });
-    if(!ids.length) return '';
-    const idx=(index&&typeof index==='object')?index:_messageToolRenderIndex();
-    let hash=2166136261;
-    function addDigestByte(value){
-      const s=String(value==null?'':value);
-      for(let i=0;i<s.length;i++){
-        hash^=s.charCodeAt(i);
-        hash=Math.imul(hash,16777619)>>>0;
-      }
-      hash^=31;
-      hash=Math.imul(hash,16777619)>>>0;
-    }
-    for(const tid of ids){
-      addDigestByte(tid);
-      const results=(idx.byTid&&typeof idx.byTid.get==='function')?idx.byTid.get(tid):null;
-      if(results&&results.length){ addDigestByte('result'); for(const body of results) _addBoundedHash(addDigestByte, body); }
-      else addDigestByte('result-none');
-      const settled=(idx.settled&&typeof idx.settled.get==='function')?idx.settled.get(tid):null;
-      addDigestByte('settled'); if(settled) _addBoundedHash(addDigestByte, settled);
-      const persisted=(idx.persisted&&typeof idx.persisted.get==='function')?idx.persisted.get(tid):null;
-      addDigestByte('persisted'); if(persisted) _addBoundedHash(addDigestByte, persisted);
-    }
-    return hash.toString(16);
-  }catch(_e){ return failClosed(); }
 }
 
 function _messageRenderCacheSignature(){
@@ -16394,17 +16264,11 @@ function _messageRenderCacheSignature(){
      m._partial_tool_calls, reasoning (including reasoning_content), the
      activity scene, status cards, attachments and content-array parts are all
      covered, with no hand-maintained field list that can drift (review
-     finding on #8228). The explicit extractions below stay as cheap,
-     diagnosable first-order discriminators for the same fields;
-     _messageRenderHeightFingerprint drives the virtual row-height reuse
-     matcher from the same shared function, so the two consumers cannot
-     drift apart. */
+     finding on #8228). One hash per message: the earlier explicit
+     msgContent/tool_calls extractions re-hashed content the object walk
+     already covers, doubling the cost on large tool sessions (371 ms vs
+     135 ms measured on a 3.6 MB transcript — #8228 re-review). */
   for(const m of messages){
-    if(m&&typeof m==='object'){
-      add(msgContent(m));
-      if(Array.isArray(m.tool_calls)) add(m.tool_calls.length);
-      if(Array.isArray(m._partial_tool_calls)) add(m._partial_tool_calls.length);
-    }
     _addMessageRenderHash(add, m);
   }
   const toolCalls=Array.isArray(S.toolCalls)?S.toolCalls:[];

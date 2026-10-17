@@ -23,6 +23,16 @@ three positions, and at every position proves against the live DOM:
 A final full-render (virtualization off) pass repeats 1-3, because the binary
 search must work in both modes with no height-cache dependency.
 
+The gate runs this proof on TWO transcripts: a plain question/answer one, and
+a tool-call transcript where every turn's tool-call assistant message renders
+a hidden `assistant-segment-worklog-source` row (display:none!important, all-
+zero rect) still carrying data-msg-idx — the exact CORE-1 regression shape the
+#8228 re-review reproduced (18 of 20 fast-anchor picks diverged from the
+linear reference). The reference predicate skips those hidden rows, so the
+gate proves the fast path lands on the same laid-out row as the per-row scan
+with the hidden rows interleaved, and asserts the transcript actually produced
+them (hidden > 0).
+
 Exit 0 = proof passed. Non-zero = a real-browser failure; a screenshot and a
 snapshot are written to the artifact directory.
 """
@@ -53,6 +63,53 @@ def _long_transcript_messages() -> list[dict]:
             {
                 "role": "user",
                 "content": f"Question {i}: " + ("context line for a tall user row. " * 8),
+            }
+        )
+        messages.append(
+            {
+                "role": "assistant",
+                "content": f"Answer {i}: "
+                + ("A fairly long answer paragraph so every row is tall enough to scroll. " * 8),
+            }
+        )
+    return messages
+
+
+def _tool_call_transcript_messages() -> list[dict]:
+    """Tool-call transcript: every turn has a tool-call assistant message with
+    NO visible text, so in the DEFAULT compact_worklog mode each one renders a
+    hidden `assistant-segment-worklog-source` row that still carries
+    data-msg-idx (display:none!important, all-zero rect) — the exact CORE-1
+    shape the #8228 re-review reproduced (18 of 20 fast-anchor picks diverged
+    from the linear reference on a 150-turn tool transcript). The gate must
+    prove the binary search skips those rows and lands on the same laid-out
+    row as the per-row scan."""
+    messages: list[dict] = []
+    for i in range(1, MESSAGE_PAIRS + 1):
+        messages.append(
+            {
+                "role": "user",
+                "content": f"Question {i}: " + ("context line for a tall user row. " * 8),
+            }
+        )
+        messages.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": f"call_{i}",
+                        "type": "function",
+                        "function": {"name": "shell", "arguments": json.dumps({"cmd": f"echo {i}"})},
+                    }
+                ],
+            }
+        )
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": f"call_{i}",
+                "content": f"Result {i}: " + ("a fairly long tool output line. " * 12),
             }
         )
         messages.append(
@@ -99,10 +156,16 @@ _ANCHOR_PROBE_JS = """
   const container = document.getElementById('messages');
   const containerRect = container.getBoundingClientRect();
   const rows = container.querySelectorAll('[data-msg-idx]');
-  // Independent reference: first rendered row whose bottom edge crosses the
-  // container's top edge (the definition the per-row scan implements).
+  // Independent reference: first LAID-OUT row whose bottom edge crosses the
+  // container's top edge (the definition the per-row scan implements). Hidden
+  // display:none rows (.assistant-segment-worklog-source / -anchor) have
+  // all-zero rects and must be skipped — on a tool-call transcript in the
+  // default compact_worklog mode they interleave with visible rows, which is
+  // exactly the #8228 CORE-1 regression an unfiltered search hit.
   let refIdx = null;
   for (const row of rows) {
+    if (row.classList.contains('assistant-segment-worklog-source')) continue;
+    if (row.classList.contains('assistant-segment-anchor')) continue;
     const r = row.getBoundingClientRect();
     if (r.bottom > containerRect.top + 1) { refIdx = Number(row.dataset.msgIdx); break; }
   }
@@ -124,6 +187,10 @@ _ANCHOR_PROBE_JS = """
     slow: pick(slow),
     slowReads,
     rowCount: rows.length,
+    hiddenCount: document.querySelectorAll(
+      '#messages [data-msg-idx].assistant-segment-worklog-source,' +
+      '#messages [data-msg-idx].assistant-segment-anchor'
+    ).length,
     scrollTop: Math.round(container.scrollTop),
     scrollHeight: Math.round(container.scrollHeight),
   };
@@ -145,7 +212,7 @@ def _scroll_to(page, fraction: float) -> None:
     page.wait_for_timeout(500)
 
 
-def _assert_anchor_proof(page, label: str, *, expect_virtualized: bool) -> dict:
+def _assert_anchor_proof(page, label: str, *, expect_virtualized: bool, total_messages: int) -> dict:
     probe = page.evaluate(_ANCHOR_PROBE_JS)
     assert probe["refIdx"] is not None, f"{label}: reference predicate found no covering row"
     assert probe["fast"] is not None, f"{label}: fast anchor returned null"
@@ -164,11 +231,67 @@ def _assert_anchor_proof(page, label: str, *, expect_virtualized: bool) -> dict:
     )
     assert probe["slowReads"] >= 1, f"{label}: fallback counter did not bite ({probe})"
     if expect_virtualized:
-        assert probe["rowCount"] < 2 * MESSAGE_PAIRS, (
+        assert probe["rowCount"] < total_messages, (
             f"{label}: virtualization is not active — all {probe['rowCount']} rows rendered"
         )
         assert probe["scrollTop"] > 0, f"{label}: scrolled position did not stick ({probe})"
     return probe
+
+
+def _run_transcript_proof(page, messages: list[dict], last_text: str, label: str, *, expect_hidden: bool) -> None:
+    session_id = page.evaluate(
+        _IMPORT_AND_LOAD_JS,
+        {"messages": messages, "lastText": last_text},
+    )
+    assert session_id, f"{label}: imported session id missing"
+
+    # Turn transcript virtualization on through the page and stop following
+    # the tail so a programmatic scroll sticks.
+    page.evaluate(
+        """() => {
+          window._autoScrollFollow = false;
+          window._virtualizeTranscript = true;
+          renderMessages({preserveScroll: true});
+        }"""
+    )
+    page.wait_for_timeout(600)
+
+    if expect_hidden:
+        hidden = page.evaluate(
+            """() => document.querySelectorAll(
+              '#messages [data-msg-idx].assistant-segment-worklog-source,' +
+              '#messages [data-msg-idx].assistant-segment-anchor'
+            ).length"""
+        )
+        assert hidden > 0, (
+            f"{label}: tool-call transcript produced no hidden worklog rows — "
+            f"the gate is not exercising the CORE-1 regression shape"
+        )
+        print(f"OK  {label}: {hidden} hidden display:none rows interleaved with laid-out rows")
+
+    for fraction, pos in ((0.25, "quarter"), (0.5, "middle"), (0.75, "three-quarter")):
+        _scroll_to(page, fraction)
+        probe = _assert_anchor_proof(
+            page, f"{label}/virtualized/{pos}", expect_virtualized=True, total_messages=len(messages)
+        )
+        print(
+            f"OK  {label} virtualized {pos}: fast anchor == reference (row {probe['refIdx']}), "
+            f"0 fallback reads, {probe['rowCount']} rendered rows"
+        )
+
+    # Full-render mode: both paths must still agree (no cache dependency).
+    page.evaluate(
+        """() => {
+          window._virtualizeTranscript = false;
+          renderMessages({preserveScroll: true});
+        }"""
+    )
+    page.wait_for_timeout(600)
+    _scroll_to(page, 0.5)
+    _assert_anchor_proof(
+        page, f"{label}/full-render/middle", expect_virtualized=False, total_messages=len(messages)
+    )
+    print(f"OK  {label} full-render mode: fast anchor identical to the per-row scan")
 
 
 def main() -> int:
@@ -235,42 +358,13 @@ def main() -> int:
             "() => typeof window._autoScrollFollow === 'boolean'",
             timeout=15000,
         )
-        session_id = page.evaluate(
-            _IMPORT_AND_LOAD_JS,
-            {"messages": _long_transcript_messages(), "lastText": LAST_TEXT},
+        # Both transcripts prove the anchor: the plain one (baseline coverage)
+        # and the tool-call one (hidden worklog-source rows interleaved — the
+        # #8228 CORE-1 regression shape the maintainer asked the gate to add).
+        _run_transcript_proof(page, _long_transcript_messages(), LAST_TEXT, "plain", expect_hidden=False)
+        _run_transcript_proof(
+            page, _tool_call_transcript_messages(), LAST_TEXT, "tool-call", expect_hidden=True
         )
-        assert session_id, "imported session id missing"
-
-        # Turn transcript virtualization on through the page and stop following
-        # the tail so a programmatic scroll sticks.
-        page.evaluate(
-            """() => {
-              window._autoScrollFollow = false;
-              window._virtualizeTranscript = true;
-              renderMessages({preserveScroll: true});
-            }"""
-        )
-        page.wait_for_timeout(600)
-
-        for fraction, label in ((0.25, "quarter"), (0.5, "middle"), (0.75, "three-quarter")):
-            _scroll_to(page, fraction)
-            probe = _assert_anchor_proof(page, f"virtualized/{label}", expect_virtualized=True)
-            print(
-                f"OK  virtualized {label}: fast anchor == reference (row {probe['refIdx']}), "
-                f"0 fallback reads, {probe['rowCount']} rendered rows"
-            )
-
-        # Full-render mode: both paths must still agree (no cache dependency).
-        page.evaluate(
-            """() => {
-              window._virtualizeTranscript = false;
-              renderMessages({preserveScroll: true});
-            }"""
-        )
-        page.wait_for_timeout(600)
-        _scroll_to(page, 0.5)
-        _assert_anchor_proof(page, "full-render/middle", expect_virtualized=False)
-        print("OK  full-render mode: fast anchor identical to the per-row scan")
 
         if errors:
             raise AssertionError(f"unexpected browser errors: {errors!r}")

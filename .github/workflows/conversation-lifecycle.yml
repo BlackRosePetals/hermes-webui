@@ -80,6 +80,11 @@ jobs:
         env:
           LIFECYCLE_ARTIFACT_DIR: lifecycle-artifacts
           HISTORICAL_HYDRATION_ARTIFACT_DIR: lifecycle-artifacts
+          # #8228 greptile P2: the virtual-transcript-anchor gate wrote its
+          # screenshot/snapshot/server log to a private temp dir, so a red
+          # matrix entry uploaded no evidence. Point it at the one directory
+          # the upload step below collects.
+          VIRTUAL_ANCHOR_ARTIFACT_DIR: lifecycle-artifacts
           LIFECYCLE_SCENARIO: ${{ matrix.scenario }}
           BROWSERS: ${{ matrix.browsers }}
         run: python ${{ matrix.script }}

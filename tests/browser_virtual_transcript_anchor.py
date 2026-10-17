@@ -133,7 +133,21 @@ async ({messages, lastText}) => {
   if (!response.ok || !data.session || !data.session.session_id) {
     throw new Error('session import failed: ' + JSON.stringify(data));
   }
-  await loadSession(data.session.session_id);
+  const sid = data.session.session_id;
+  await loadSession(sid);
+  // #8228 greptile P2: loadSession lands on a BOUNDED TAIL (msg_limit=30).
+  // MESSAGE_VIRTUAL_THRESHOLD_ROWS is 80, so a 30-row window never virtualizes:
+  // every row renders and the old `rowCount < len(messages)` check passed only
+  // because the transcript was truncated. Pull the COMPLETE transcript through
+  // the documented msg_limit=all escape hatch (the same shape the outline jump
+  // path uses) before the gate turns virtualization on.
+  const full = await fetch(
+    '/api/session?session_id=' + encodeURIComponent(sid) + '&messages=1&resolve_model=0&msg_limit=all'
+  ).then((r) => r.json());
+  if (full && full.session && Array.isArray(full.session.messages) && full.session.messages.length) {
+    S.messages = full.session.messages;
+    renderMessages({preserveScroll: false});
+  }
   await new Promise((resolve, reject) => {
     const deadline = Date.now() + 15000;
     const check = () => {
@@ -144,7 +158,7 @@ async ({messages, lastText}) => {
     };
     check();
   });
-  return data.session.session_id;
+  return sid;
 }
 """
 
@@ -212,7 +226,7 @@ def _scroll_to(page, fraction: float) -> None:
     page.wait_for_timeout(500)
 
 
-def _assert_anchor_proof(page, label: str, *, expect_virtualized: bool, total_messages: int) -> dict:
+def _assert_anchor_proof(page, label: str, *, expect_virtualized: bool, renderable_rows: int) -> dict:
     probe = page.evaluate(_ANCHOR_PROBE_JS)
     assert probe["refIdx"] is not None, f"{label}: reference predicate found no covering row"
     assert probe["fast"] is not None, f"{label}: fast anchor returned null"
@@ -231,19 +245,42 @@ def _assert_anchor_proof(page, label: str, *, expect_virtualized: bool, total_me
     )
     assert probe["slowReads"] >= 1, f"{label}: fallback counter did not bite ({probe})"
     if expect_virtualized:
-        assert probe["rowCount"] < total_messages, (
-            f"{label}: virtualization is not active — all {probe['rowCount']} rows rendered"
+        assert probe["rowCount"] < renderable_rows, (
+            f"{label}: virtualization is not active — all {probe['rowCount']} rows rendered "
+            f"(renderable rows: {renderable_rows})"
         )
         assert probe["scrollTop"] > 0, f"{label}: scrolled position did not stick ({probe})"
     return probe
 
 
+def _renderable_row_count(messages: list[dict]) -> int:
+    """How many transcript rows these messages can actually mount.
+
+    ``role: 'tool'`` payloads are folded into their assistant segment's
+    worklog and never produce their own ``data-msg-idx`` row, so a
+    240-message tool transcript only ever mounts 180 rows. Comparing
+    ``rowCount`` against ``len(messages)`` therefore proved nothing: the
+    virtualized assertion passed even with virtualization switched off
+    (#8228 greptile P2).
+    """
+    return sum(1 for m in messages if str(m.get("role") or "") != "tool")
+
+
 def _run_transcript_proof(page, messages: list[dict], last_text: str, label: str, *, expect_hidden: bool) -> None:
+    renderable_rows = _renderable_row_count(messages)
     session_id = page.evaluate(
         _IMPORT_AND_LOAD_JS,
         {"messages": messages, "lastText": last_text},
     )
     assert session_id, f"{label}: imported session id missing"
+    loaded_rows = page.evaluate(
+        "() => (typeof S !== 'undefined' && Array.isArray(S.messages)) ? S.messages.length : -1"
+    )
+    assert loaded_rows >= renderable_rows, (
+        f"{label}: the client holds {loaded_rows} of {renderable_rows} renderable rows — the "
+        "transcript is still on a bounded tail, so every virtualization assertion below "
+        "would be vacuous (#8228 greptile P2)"
+    )
 
     # Turn transcript virtualization on through the page and stop following
     # the tail so a programmatic scroll sticks.
@@ -272,7 +309,7 @@ def _run_transcript_proof(page, messages: list[dict], last_text: str, label: str
     for fraction, pos in ((0.25, "quarter"), (0.5, "middle"), (0.75, "three-quarter")):
         _scroll_to(page, fraction)
         probe = _assert_anchor_proof(
-            page, f"{label}/virtualized/{pos}", expect_virtualized=True, total_messages=len(messages)
+            page, f"{label}/virtualized/{pos}", expect_virtualized=True, renderable_rows=renderable_rows
         )
         print(
             f"OK  {label} virtualized {pos}: fast anchor == reference (row {probe['refIdx']}), "
@@ -288,10 +325,17 @@ def _run_transcript_proof(page, messages: list[dict], last_text: str, label: str
     )
     page.wait_for_timeout(600)
     _scroll_to(page, 0.5)
-    _assert_anchor_proof(
-        page, f"{label}/full-render/middle", expect_virtualized=False, total_messages=len(messages)
+    full = _assert_anchor_proof(
+        page, f"{label}/full-render/middle", expect_virtualized=False, renderable_rows=renderable_rows
     )
-    print(f"OK  {label} full-render mode: fast anchor identical to the per-row scan")
+    assert full["rowCount"] >= renderable_rows, (
+        f"{label}: full-render mode mounted {full['rowCount']} of {renderable_rows} renderable rows — "
+        "virtualization is still on, so this pass checked nothing"
+    )
+    print(
+        f"OK  {label} full-render mode: fast anchor identical to the per-row scan "
+        f"({full['rowCount']}/{renderable_rows} rows mounted)"
+    )
 
 
 def main() -> int:

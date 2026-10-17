@@ -41,6 +41,7 @@ EXIT CODES
       not reachable on cdn.jsdelivr.net, etc.)
 """
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -59,6 +60,9 @@ def _free_port():
 PORT = int(os.getenv("TERMINAL_SR_MODE_PORT") or _free_port())
 BASE = f"http://127.0.0.1:{PORT}"
 MARKER = "sr-mode-marker-42"
+# The shell expands this to MARKER, so MARKER appears only in the output row,
+# never in the typed command line.
+MARKER_COMMAND = "echo sr-mode-marker-$((40+2))"
 
 
 class _SetupError(Exception):
@@ -98,9 +102,9 @@ BUFFER_HAS_TEXT = (
     "return false})()"
 )
 TREE = "!!document.querySelector('#terminalSurface .xterm-accessibility-tree')"
-TREE_TEXT = (
-    "(document.querySelector('#terminalSurface .xterm-accessibility-tree')||{})"
-    ".textContent||''"
+TREE_HAS_MARKER_ROW = (
+    "[...document.querySelectorAll('#terminalSurface .xterm-accessibility-tree > div')]"
+    f".some(r=>r.textContent.trim()==='{MARKER}')"
 )
 
 
@@ -117,6 +121,15 @@ def _open_terminal(page):
 
 
 def _set_preference(page, checked):
+    """Set the preference through the Settings panel; return an error text or None."""
+    from playwright.sync_api import TimeoutError as PlaywrightTimeout
+    try:
+        return _set_preference_or_raise(page, checked)
+    except PlaywrightTimeout as e:
+        return f"timed out: {str(e).splitlines()[0]}"
+
+
+def _set_preference_or_raise(page, checked):
     # Wait for the panel to hydrate from the server, or it would overwrite the click.
     with page.expect_response(
         lambda r: r.url.endswith("/api/settings") and r.request.method == "GET",
@@ -175,7 +188,7 @@ def _check(browser, name):
         lambda r: "/api/terminal/input" in r.url and r.request.method == "POST",
         timeout=10000,
     ):
-        page.keyboard.insert_text(f"echo {MARKER}")
+        page.keyboard.insert_text(MARKER_COMMAND)
     page.keyboard.press("Enter")
     if not _wait_until(
         page,
@@ -197,7 +210,7 @@ def _check(browser, name):
     if not _wait_until(page, TREE):
         failures.append(f"  [{name}] enabling: the open terminal got no accessibility tree")
     # xterm fills the rows of a freshly built tree on a later render pass.
-    elif not _wait_until(page, f"({TREE_TEXT}).includes('{MARKER}')"):
+    elif not _wait_until(page, TREE_HAS_MARKER_ROW):
         failures.append(f"  [{name}] enabling: earlier output is missing from the accessibility tree")
 
     err = _set_preference(page, False)
@@ -206,15 +219,22 @@ def _check(browser, name):
     if not _wait_until(page, "!" + TREE):
         failures.append(f"  [{name}] disabling: the accessibility tree stayed on the open terminal")
 
-    _set_preference(page, True)
+    err = _set_preference(page, True)
+    if err:
+        failures.append(f"  [{name}] re-enabling before the reload: {err}")
     page.reload(wait_until="domcontentloaded")
-    if not _wait_until(page, "typeof window.Terminal==='function'&&window._screenReaderMode===true", 20000):
-        failures.append(f"  [{name}] after reload: the saved preference was not applied on boot")
-    elif not _open_terminal(page):
-        failures.append(f"  [{name}] after reload: terminal did not open")
-    elif not _wait_until(page, TREE):
-        failures.append(f"  [{name}] after reload: a new terminal started without the accessibility tree")
-    _set_preference(page, False)
+    # Without a saved "on", the checks after the reload would only repeat that failure.
+    if not err:
+        if not _wait_until(page, "typeof window.Terminal==='function'&&window._screenReaderMode===true", 20000):
+            failures.append(f"  [{name}] after reload: the saved preference was not applied on boot")
+        elif not _open_terminal(page):
+            failures.append(f"  [{name}] after reload: terminal did not open")
+        elif not _wait_until(page, TREE):
+            failures.append(f"  [{name}] after reload: a new terminal started without the accessibility tree")
+    # Leave the shared server with the preference off for the next browser.
+    err = _set_preference(page, False)
+    if err:
+        failures.append(f"  [{name}] resetting the preference: {err}")
 
     for e in errors:
         failures.append(f"  [{name}] pageerror: {e}")
@@ -289,6 +309,9 @@ def main():
                 try:
                     failures.extend(_check(browser, name))
                 except _SetupError as e:
+                    if failures:
+                        print("\nTERMINAL SCREEN READER MODE FAILED before the setup failure:", file=sys.stderr)
+                        print("\n".join(failures), file=sys.stderr)
                     print(f"SETUP FAIL: {e}", file=sys.stderr)
                     return 2
                 finally:
@@ -306,6 +329,8 @@ def main():
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+        log.close()
+        shutil.rmtree(state_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

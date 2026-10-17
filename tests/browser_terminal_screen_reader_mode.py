@@ -37,7 +37,8 @@ USAGE
 EXIT CODES
   0 — every check passed
   1 — a check failed (regression)
-  2 — environment/setup failure (server didn't boot, playwright missing, etc.)
+  2 — environment/setup failure (server didn't boot, playwright missing, xterm.js
+      not reachable on cdn.jsdelivr.net, etc.)
 """
 import os
 import socket
@@ -91,6 +92,11 @@ def _wait_until(page, expression, timeout_ms=8000):
     return False
 
 
+BUFFER_HAS_TEXT = (
+    "(()=>{const b=TERMINAL_UI.term.buffer.active;for(let i=0;i<b.length;i++)"
+    "{const l=b.getLine(i);if(l&&l.translateToString(true).trim())return true}"
+    "return false})()"
+)
 TREE = "!!document.querySelector('#terminalSurface .xterm-accessibility-tree')"
 TREE_TEXT = (
     "(document.querySelector('#terminalSurface .xterm-accessibility-tree')||{})"
@@ -143,16 +149,33 @@ def _check(browser, name):
     errors = []
     page.on("pageerror", lambda e: errors.append(str(e)))
     page.goto(BASE, wait_until="domcontentloaded")
-    if not _wait_until(page, "typeof window.Terminal==='function'&&!!document.querySelector('#msg')", 20000):
+    if not _wait_until(page, "!!document.querySelector('#msg')", 20000):
         ctx.close()
-        raise _SetupError(f"[{name}] xterm.js or the composer did not load (network access to cdn.jsdelivr.net?)")
+        raise _SetupError(f"[{name}] the composer did not load")
+    if not _wait_until(page, "typeof window.Terminal==='function'", 20000):
+        ctx.close()
+        raise _SetupError(
+            f"[{name}] xterm.js did not load from cdn.jsdelivr.net. The page loads it from that CDN, "
+            "so this gate needs network access to it. This is an environment problem, not a regression."
+        )
 
     if not _open_terminal(page):
         ctx.close()
         return [f"  [{name}] terminal did not open"]
     page.evaluate("TERMINAL_UI.term._srGateId=1")
+    # Type only once the shell has printed its prompt, or the command can reach it
+    # before it reads input.
+    if not _wait_until(page, BUFFER_HAS_TEXT, 10000):
+        ctx.close()
+        return [f"  [{name}] the shell printed no prompt"]
     page.evaluate("focusComposerTerminalInput()")
-    page.keyboard.type(f"echo {MARKER}")
+    # Send the command as one input POST and wait for it before Enter. Typing key by
+    # key sends one POST per character, and those can reach the shell out of order.
+    with page.expect_response(
+        lambda r: "/api/terminal/input" in r.url and r.request.method == "POST",
+        timeout=10000,
+    ):
+        page.keyboard.insert_text(f"echo {MARKER}")
     page.keyboard.press("Enter")
     if not _wait_until(
         page,

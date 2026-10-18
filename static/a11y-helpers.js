@@ -1,0 +1,262 @@
+/* Shared accessibility (a11y) helpers.
+ *
+ * Small, dependency-free functions that give existing widgets the ARIA contract
+ * and keyboard behaviour a screen reader expects, without changing how they
+ * look or how mouse and touch users operate them.
+ */
+
+/* Accessible name for an element whose visible text is missing or misleading.
+ * Never overrides a name the markup already provides.
+ */
+function a11yLabel(el, text){
+  if (!el || !text) return;
+  const clean = String(text).replace(/\s+/g, ' ').trim();
+  if (!clean) return;
+  if (!el.getAttribute('aria-label') && !el.getAttribute('aria-labelledby')) {
+    el.setAttribute('aria-label', clean);
+  }
+}
+
+/* TREE (workspace files) - role=tree contract.
+ *
+ * Without it a screen reader read the Files tab as "▸ .cache × ▸ .cloak-venv ×":
+ * rows were <div>s with no role and no tabindex (not a control, unreachable by
+ * keyboard), the disclosure arrow was a bare ▸/▾ glyph with no aria-expanded,
+ * the delete button was named "×", the container had no role and nothing
+ * conveyed the nesting depth.
+ *
+ * Why role=tree instead of a list of buttons: directories COLLAPSE and rows are
+ * NESTED. The tree role is the only one with vocabulary for both facts
+ * (aria-expanded + aria-level), and screen readers have built-in navigation
+ * for it.
+ *
+ * Focus pattern: ONE tabindex=0 across the whole tree (roving), arrow keys move
+ * between rows. Otherwise a tree with a hundred files would cost a hundred Tab
+ * presses to get past. Every row starts at tabindex=-1; a11yTreeRestoreFocus()
+ * places the single tab stop after each render.
+ */
+function a11yTreeRow(row, opts){
+  const o = opts || {};
+  if (!row || typeof row.setAttribute !== 'function') return row;
+  row.setAttribute('role', 'treeitem');
+  if (Number(o.level) > 0) row.setAttribute('aria-level', String(Math.floor(o.level)));
+  // Directory: say whether it is expanded. File: NO aria-expanded - on a leaf
+  // the attribute would suggest that something can be expanded.
+  if (o.expandable) row.setAttribute('aria-expanded', o.expanded ? 'true' : 'false');
+  else row.removeAttribute('aria-expanded');
+  if (o.disabled) row.setAttribute('aria-disabled', 'true');
+  // Accessible name: the entry name plus its kind, so "folder" is audible even
+  // though the icon is hidden from the screen reader.
+  if (o.label) a11yLabel(row, o.label);
+  if (o.description) row.setAttribute('aria-description', String(o.description));
+  row.setAttribute('tabindex', '-1');
+  // Stable identity for restoring the keyboard position after a rebuild. The
+  // index cannot serve here: expanding a directory changes how many rows
+  // precede an entry. See a11yTreeRememberFocus / a11yTreeRestoreFocus.
+  if (o.path && row.dataset) row.dataset.a11yTreePath = String(o.path);
+  return row;
+}
+
+/* Tree container: role, name, and Arrow/Home/End/Enter/Space navigation.
+ * Idempotent - call after every render that leaves rows in the container.
+ */
+function a11yTree(container, opts){
+  const o = opts || {};
+  if (!container || typeof container.querySelectorAll !== 'function') return container;
+  container.setAttribute('role', 'tree');
+  // The container persists across renders, so set the name on every render
+  // (after a language switch the next render renames it).
+  if (o.label) container.setAttribute('aria-label', String(o.label));
+  if (container.dataset && container.dataset.a11yTreeBound === '1') return container;
+  if (container.dataset) container.dataset.a11yTreeBound = '1';
+  if (typeof container.addEventListener !== 'function') return container;
+
+  const rows = () => Array.from(container.querySelectorAll('[role="treeitem"]'));
+  const moveFocus = (target) => {
+    if (target && typeof target.focus === 'function') target.focus();
+  };
+  // Toggling a folder re-renders the tree only after its listing loads. Until
+  // then the row still reads collapsed, so a second Right (or an auto-repeated
+  // key) would toggle it straight back; the re-render replaces the row and
+  // with it this mark.
+  const toggle = (row) => {
+    if (row.dataset && row.dataset.a11yTreeToggled === '1') return;
+    if (row.dataset) row.dataset.a11yTreeToggled = '1';
+    if (typeof row.click === 'function') row.click();
+  };
+
+  // Every focused row becomes the tab stop - by arrow keys, pointer, or the
+  // screen reader's own navigation - so Tab out and back returns to it.
+  container.addEventListener('focusin', (ev) => {
+    const target = ev && ev.target;
+    if (target && typeof target.getAttribute === 'function'
+        && target.getAttribute('role') === 'treeitem') _a11yTreeSetTabStop(container, target);
+  });
+
+  container.addEventListener('keydown', (ev) => {
+    const key = ev && ev.key;
+    if (!key || ev.altKey || ev.ctrlKey || ev.metaKey) return;
+    // Only keys pressed ON a row are tree navigation. Keys typed into a control
+    // inside a row (the inline rename input) belong to that control.
+    const current = ev.target;
+    if (!current || typeof current.getAttribute !== 'function'
+        || current.getAttribute('role') !== 'treeitem') return;
+    const items = rows();
+    const i = items.indexOf(current);
+    if (i < 0) return;
+
+    if (key === 'ArrowDown' || key === 'ArrowUp') {
+      ev.preventDefault();
+      const next = items[i + (key === 'ArrowDown' ? 1 : -1)];
+      if (next) moveFocus(next);
+      return;
+    }
+    if (key === 'Home' || key === 'End') {
+      ev.preventDefault();
+      moveFocus(key === 'Home' ? items[0] : items[items.length - 1]);
+      return;
+    }
+    const expandable = current.hasAttribute('aria-expanded');
+    const expanded = current.getAttribute('aria-expanded') === 'true';
+
+    // Right arrow: expand a collapsed directory; on an expanded one, move to
+    // its first child.
+    if (key === 'ArrowRight') {
+      ev.preventDefault();
+      if (!expandable) return;
+      if (!expanded) { toggle(current); return; }
+      const child = items[i + 1];
+      const level = Number(current.getAttribute('aria-level') || 0);
+      if (child && Number(child.getAttribute('aria-level') || 0) > level) moveFocus(child);
+      return;
+    }
+    // Left arrow: collapse an expanded directory; otherwise move to the parent.
+    if (key === 'ArrowLeft') {
+      ev.preventDefault();
+      if (expandable && expanded) { toggle(current); return; }
+      const level = Number(current.getAttribute('aria-level') || 0);
+      for (let j = i - 1; j >= 0; j--) {
+        if (Number(items[j].getAttribute('aria-level') || 0) < level) { moveFocus(items[j]); return; }
+      }
+      return;
+    }
+    if (key === 'Enter' || key === ' ') {
+      ev.preventDefault();
+      if (current.getAttribute('aria-disabled') === 'true') return;
+      if (expandable) toggle(current);
+      else if (typeof current.click === 'function') current.click();
+    }
+  });
+  return container;
+}
+
+/* Move the single tab stop. Only the previous and the new row change, so
+ * holding an arrow key in a large tree stays cheap. */
+function _a11yTreeSetTabStop(container, target){
+  const prev = container._a11yTreeStop;
+  if (prev && prev !== target) prev.setAttribute('tabindex', '-1');
+  target.setAttribute('tabindex', '0');
+  container._a11yTreeStop = target;
+}
+
+/* The container no longer holds rows (empty folder, skeleton, no session):
+ * it is not a tree, and a generic element must not keep the tree's name. */
+function a11yTreeReset(container){
+  if (!container || typeof container.removeAttribute !== 'function') return;
+  container.removeAttribute('role');
+  container.removeAttribute('aria-label');
+  container._a11yTreeStop = null;
+  container._a11yTreeCarry = null;
+}
+
+/* Keep the keyboard position across a full tree rebuild.
+ *
+ * Toggling a directory calls click(), which re-renders the whole tree: every
+ * row is replaced and the single tab stop would go back to the FIRST top-level
+ * row. The row the user just toggled is detached, so focus falls to
+ * document.body and the next arrow press restarts at the top of the tree.
+ *
+ * Identity is the entry PATH, not the index: expanding changes how many rows
+ * precede an entry, so a remembered index points somewhere else after the
+ * rebuild. When the remembered entry is gone (deleted, renamed, collapsed
+ * away) the tab stop goes to the row that followed it, else the one before
+ * it, else the first row - a tree with no tab stop is unreachable by keyboard.
+ *
+ * The fallback order is: the row that followed it, the one before it, the
+ * nearest folder above it that is still shown, then the first row.
+ *
+ * A miss can be temporary: a root refresh renders once with the folder
+ * listings cleared and again when they load. The caller marks that first
+ * render as partial ({carry: true}) and the second as completing it
+ * ({completesRefill: true}). The missed token is used only by the completing
+ * render, and only if the user has not moved off the fallback row in between;
+ * any other render in the gap leaves it alone.
+ */
+function a11yTreeRememberFocus(container, opts){
+  try {
+    if (!container || typeof container.querySelectorAll !== 'function') return null;
+    const rows = Array.from(container.querySelectorAll('[role="treeitem"]'));
+    const active = (typeof document !== 'undefined' && document.activeElement) || null;
+    // Focus on a control inside a row (rename input, delete button) counts too.
+    const focusedRow = active ? rows.find((r) => r === active || r.contains(active)) : null;
+    const hadFocus = !!focusedRow;
+    // Without focus, still keep the tab stop where the user left it.
+    const tracked = container._a11yTreeStop;
+    const stop = focusedRow || (tracked && rows.indexOf(tracked) >= 0 ? tracked : null);
+    const carried = container._a11yTreeCarry;
+    if (opts && opts.completesRefill) {
+      container._a11yTreeCarry = null;
+      if (carried && stop && stop === carried.fallback) {
+        return Object.assign({}, carried.token, {hadFocus: hadFocus, carried: true});
+      }
+    }
+    const pathOf = (r) => (r && r.dataset && r.dataset.a11yTreePath) || null;
+    const path = pathOf(stop);
+    if (!path) return null;
+    const i = rows.indexOf(stop);
+    return {path: path, next: pathOf(rows[i + 1]), prev: pathOf(rows[i - 1]), hadFocus: hadFocus};
+  } catch (_e) { return null; }
+}
+
+function a11yTreeRestoreFocus(container, token, opts){
+  try {
+    if (!container || typeof container.querySelectorAll !== 'function') return;
+    const rows = Array.from(container.querySelectorAll('[role="treeitem"]'));
+    if (!rows.length) return;
+    const byPath = (p) => (p && rows.find((r) => r.dataset && r.dataset.a11yTreePath === p)) || null;
+    const ancestor = (p) => {
+      for (let q = String(p || ''); q.lastIndexOf('/') > 0;) {
+        q = q.slice(0, q.lastIndexOf('/'));
+        const hit = byPath(q);
+        if (hit) return hit;
+      }
+      return null;
+    };
+    const exact = token ? byPath(token.path) : null;
+    const target = exact
+      || (token && (byPath(token.next) || byPath(token.prev) || ancestor(token.path)))
+      || rows[0];
+    if (token && !exact && opts && opts.carry) {
+      container._a11yTreeCarry = {token: token, fallback: target};
+    }
+    _a11yTreeSetTabStop(container, target);
+    // Only take focus when the tree had it before - otherwise a background
+    // refresh would steal focus from whatever the user is doing elsewhere. The
+    // scroll position was already restored by the caller.
+    if (token && token.hadFocus && typeof target.focus === 'function') {
+      target.focus({preventScroll: true});
+      // A carried position comes back after a shorter partial render clamped
+      // the scroll offset, so bring the row into view if it ended up outside.
+      if (token.carried && typeof target.scrollIntoView === 'function') target.scrollIntoView({block: 'nearest'});
+    }
+  } catch (_e) { /* a rebuild must never fail because of focus bookkeeping */ }
+}
+
+if (typeof window !== 'undefined') {
+  window.a11yLabel = a11yLabel;
+  window.a11yTree = a11yTree;
+  window.a11yTreeRow = a11yTreeRow;
+  window.a11yTreeReset = a11yTreeReset;
+  window.a11yTreeRememberFocus = a11yTreeRememberFocus;
+  window.a11yTreeRestoreFocus = a11yTreeRestoreFocus;
+}

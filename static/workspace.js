@@ -967,6 +967,7 @@ function showWorkspaceTreeSkeleton(){
     wrap.appendChild(row);
   }
   tree.innerHTML = '';
+  if(typeof a11yTreeReset==='function') a11yTreeReset(tree);
   tree.appendChild(wrap);
   tree.style.display = '';
 }
@@ -980,7 +981,10 @@ function showWorkspaceTreeSkeleton(){
 function clearWorkspaceTreeSkeleton(){
   const tree = $('fileTree');
   if(!tree) return;
-  if(tree.querySelector('.skeleton-tree')) tree.innerHTML = '';
+  if(tree.querySelector('.skeleton-tree')){
+    tree.innerHTML = '';
+    if(typeof a11yTreeReset==='function') a11yTreeReset(tree);
+  }
 }
 
 async function loadDir(path, opts={}){
@@ -1013,7 +1017,10 @@ async function loadDir(path, opts={}){
       if(typeof syncTerminalButton==='function')syncTerminalButton();
       showToast(t('workspace_recovered_notice',S.session.workspace),5000,'warning');
     }
-    S.entries=data.entries||[];renderBreadcrumb();renderFileTree();
+    // A root refresh cleared the expanded folders' listings; this first render
+    // is partial when the block below will render again once they load.
+    const refillsExpanded=(!path||path==='.'||refreshExpanded)&&!!(S._expandedDirs&&S._expandedDirs.size);
+    S.entries=data.entries||[];renderBreadcrumb();renderFileTree({partial:refillsExpanded});
     // #2673 — refresh Artifacts tab when its source data (the file tree) updates.
     if(typeof renderSessionArtifacts==='function') renderSessionArtifacts();
     // Pre-fetch contents of restored expanded dirs so they render without a second click
@@ -1030,7 +1037,7 @@ async function loadDir(path, opts={}){
         if(!S.session||S.session.session_id!==sessionId||treeGen!==_wsTreeGen)return;
         for(const {dirPath,entries} of results) S._dirCache[dirPath]=entries;
       }
-      if(expanded.size>0)renderFileTree();
+      if(expanded.size>0)renderFileTree({completesRefill:true});
     }
     if(!preservePreview&&typeof clearPreview==='function'){
       if(typeof _previewDirty!=='undefined'&&_previewDirty){

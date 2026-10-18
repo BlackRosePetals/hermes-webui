@@ -309,6 +309,36 @@ WebKit when their Playwright builds are installed and launch
 unlaunchable engine is reported as skipped.
 Run it locally with `python tests/browser_session_row_activation.py`.
 
+It then runs `tests/browser_file_tree_keyboard.py`, which starts the server with
+a temporary default workspace and drives the Files tab from the keyboard in
+Chromium, and in Firefox when Playwright's build is installed. The container
+must be `role="tree"` with a name, every row a `treeitem` with `aria-level`,
+folders with `aria-expanded` and files without it, names reading "folder x",
+"file y" or "symlink z" (a symlink also describes its target), and the arrow
+glyph and icon hidden from screen readers. The tree must be a single Tab stop: Tab reaches one row and the next
+Tab leaves the tree, and the delete buttons are out of the Tab order, named
+"Delete <entry>". The focused row must keep a solid outline under forced
+colors. Up/Down, Home and End move between rows without wrapping; Right
+expands a folder and then enters it; Left goes to the parent and collapses;
+focus stays on the toggled folder across the re-render, and a second Right
+while a slow listing loads must not collapse the folder again. An empty folder
+shows an inert placeholder row that keeps focus across a re-render. Enter on a
+file opens its preview exactly once and Space toggles a folder. A background
+re-render must keep the tab stop and never move focus; the end-of-turn
+`loadDir('.')`, which renders once without folder listings and again with
+them, must leave focus on a nested row it was on, while a key pressed between
+the two renders wins. When a row and both its neighbours disappear (its folder
+collapsed), focus goes to the nearest folder above it. A mouse click on a row makes
+it the tab stop. Delete on a row asks for confirmation: cancelling keeps the
+file with focus back on the row, confirming removes it and moves focus to the
+next row, also for two deletes in a row while a folder is expanded. Keys typed into the inline rename input (Home, End, arrows, Space,
+Enter) must stay in the input; Enter there renames without opening anything
+and leaves focus on the renamed row. When the tree empties (an empty folder),
+focus moves to the Files tab and the container drops its tree role and name.
+Run it locally with
+`python tests/browser_file_tree_keyboard.py`; add `--screenshots DIR` to write
+the Files tab with keyboard focus on a row at 1440x900 and 390x844.
+
 ## Public conversation lifecycle gate
 
 `tests/browser_conversation_lifecycle.py` adds a public deterministic

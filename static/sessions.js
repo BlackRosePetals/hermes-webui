@@ -11324,6 +11324,7 @@ async function deleteSession(sid, beforeDelete=null){
       $('msgInner').innerHTML='';
       $('emptyState').style.display='';
       $('fileTree').innerHTML='';
+      if(typeof a11yTreeReset==='function') a11yTreeReset($('fileTree'));
       if(typeof S!=='undefined') S.session=null;
       if(typeof syncAppTitlebar==='function') syncAppTitlebar();
     }

@@ -24257,7 +24257,7 @@ if(!S._expandedDirs) S._expandedDirs=new Set();
 // Cache of fetched directory contents: path -> entries[]
 if(!S._dirCache) S._dirCache={};
 
-function renderFileTree(){
+function renderFileTree(opts={}){
   const box=$('fileTree');
   // #5657: capture the scroll position before wiping the container. box.innerHTML=''
   // detaches every row, collapsing scrollHeight so the browser clamps scrollTop to 0;
@@ -24269,7 +24269,21 @@ function renderFileTree(){
   // BELOW the clicked disclosure, so the clicked row keeps its offset from the top (no
   // getBoundingClientRect anchor delta needed — that's only for prepend-above cases).
   const prevScrollTop=box?box.scrollTop:0;
+  // Same class of loss as the scroll position above, one layer up: innerHTML=''
+  // detaches every row, so the roving tab stop would be rebuilt onto the FIRST
+  // row and the keyboard user thrown back to the top of the tree by the very
+  // act of expanding a directory. Remembered by entry path (the index shifts
+  // when rows appear), restored after the render tail.
+  const prevTreeFocus=(typeof a11yTreeRememberFocus==='function')
+    ? a11yTreeRememberFocus(box, {completesRefill: !!(opts&&opts.completesRefill)}) : null;
   box.innerHTML='';
+  // No rows will be rendered: the container is not a tree any more, and focus
+  // that was on a row goes to the Files tab instead of dropping to <body>.
+  const treeEmptied=()=>{
+    if(typeof a11yTreeReset==='function') a11yTreeReset(box);
+    const tab=$('workspaceFilesTab');
+    if(prevTreeFocus&&prevTreeFocus.hadFocus&&tab&&typeof tab.focus==='function') tab.focus();
+  };
   // Cache current dir entries
   S._dirCache[S.currentDir||'.']=S.entries;
   // Show empty-state when no workspace is set or the directory is empty (#703)
@@ -24279,6 +24293,7 @@ function renderFileTree(){
     _syncWorkspaceBirthtimeSupportScope('');
     if(emptyEl){emptyEl.textContent=t('workspace_empty_no_path');emptyEl.style.display='flex';}
     box.style.display='none';
+    treeEmptied();
     return;
   }
   _noteWorkspaceBirthtimeSupport(S.entries);
@@ -24287,11 +24302,26 @@ function renderFileTree(){
   const visibleEntries=_workspaceEntriesForRender(S.entries);
   if(!visibleEntries.length){
     if(emptyEl){emptyEl.textContent=t('workspace_empty_dir');emptyEl.style.display='flex';}
+    treeEmptied();
     return;
   }
   _renderTreeItems(box, visibleEntries, 0);
+  // The container must be a TREE, not a set of loose divs: without role=tree a
+  // screen reader neither announces it nor offers its own navigation, and
+  // without a name the user does not know what they entered. Called after EVERY
+  // render because innerHTML='' above destroys the rows; the helper is
+  // idempotent and binds its keyboard listener only once.
+  if(typeof a11yTree==='function'){
+    a11yTree(box, {label: t('workspace_tree_aria')});
+  }
   // #5657: restore the pre-wipe scroll position now that the tree is tall again.
   if(box) box.scrollTop=prevScrollTop;
+  // Restore the keyboard position last, after every row carries its contract.
+  // Falls back to a neighbouring or the first row when the remembered entry is
+  // gone, so the tree always keeps exactly one tab stop. A partial render (a
+  // root refresh before the expanded folders' listings are back) carries the
+  // missed position to the render that completes it.
+  if(typeof a11yTreeRestoreFocus==='function') a11yTreeRestoreFocus(box, prevTreeFocus, {carry: !!(opts&&opts.partial)});
 }
 
 let _wsActiveDragPath=null;
@@ -24448,6 +24478,28 @@ function elideMiddle(str, maxLen = 60) {
   return str.slice(0, half) + '...' + str.slice(str.length - half);
 }
 
+// Delete buttons stay for pointer users but leave the tab order: a tree has a
+// single tab stop, and a hidden "×" stop on every row would defeat it. The
+// Delete key on the focused row runs the same button instead.
+function _treeDeleteButtonA11y(row, del, name){
+  del.type='button';
+  del.tabIndex=-1;
+  del.setAttribute('aria-label', t('delete_entry_aria', name));
+  row.addEventListener('keydown',(e)=>{
+    if(e.key!=='Delete'||e.target!==row||e.altKey||e.ctrlKey||e.metaKey||e.shiftKey) return;
+    e.preventDefault();
+    del.click();
+  });
+}
+
+// Point the renamed row at its new path before the re-render, so the keyboard
+// position follows the entry instead of falling to a neighbour.
+function _treeRowRenamed(oldPath, newName){
+  const box=$('fileTree');
+  const row=box&&box.querySelector(`[data-a11y-tree-path="${CSS.escape(oldPath)}"]`);
+  if(row) row.dataset.a11yTreePath=_workspaceJoinTargetPath(_workspaceParentDir(oldPath), newName);
+}
+
 function _renderTreeItems(container, entries, depth){
   for(const item of entries){
     const el=document.createElement('div');el.className='file-item';
@@ -24482,6 +24534,9 @@ function _renderTreeItems(container, entries, depth){
       arrow.className='file-tree-toggle';
       const isExpanded=S._expandedDirs.has(item.path);
       arrow.textContent=isExpanded?'\u25BE':'\u25B8';
+      // The glyph says nothing to a screen reader; the row's aria-expanded
+      // carries the state.
+      arrow.setAttribute('aria-hidden','true');
       el.appendChild(arrow);
     }else{
       // Keep file icons aligned with sibling directories that occupy this
@@ -24495,6 +24550,8 @@ function _renderTreeItems(container, entries, depth){
     // Icon
     const iconEl=document.createElement('span');
     iconEl.className='file-icon';
+    // The entry kind is in the row's accessible name ("folder .cache").
+    iconEl.setAttribute('aria-hidden','true');
     iconEl.innerHTML = isExternalLink
       ? li('external-link', 14)
       : isDirLike
@@ -24565,6 +24622,7 @@ function _renderTreeItems(container, entries, depth){
                 session_id:S.session.session_id,path:item.path,new_name:newName
               })});
               showToast(t('renamed_to')+newName);
+              _treeRowRenamed(item.path,newName);
               // Update expanded dirs cache key if renaming a directory
               if(isDirLike&&S._expandedDirs){
                 S._expandedDirs.delete(item.path);
@@ -24609,12 +24667,14 @@ function _renderTreeItems(container, entries, depth){
       if(!isReadOnlyEscape){
         const del=document.createElement('button');
         del.className='file-del-btn';del.title=t('delete_title');del.textContent='\u00d7';
+        _treeDeleteButtonA11y(el,del,item.name);
         del.onclick=async(e)=>{e.stopPropagation();await deleteWorkspaceFile(item.path,item.name);};
         el.appendChild(del);
       }
     }else if(isDirLike&& !isReadOnlyEscape){
       const del=document.createElement('button');
       del.className='file-del-btn';del.title=t('delete_title');del.textContent='\u00d7';
+      _treeDeleteButtonA11y(el,del,item.name);
       del.onclick=async(e)=>{e.stopPropagation();await deleteWorkspaceDir(item.path,item.name);};
       el.appendChild(del);
     }
@@ -24670,6 +24730,31 @@ function _renderTreeItems(container, entries, depth){
       el.onclick=async()=>openFile(item.path);
     }
 
+    // Tree contract: only here is everything about the row known - whether it
+    // is a directory, whether it is expanded, and which level it is on.
+    if(typeof a11yTreeRow==='function'){
+      // The icon is aria-hidden, so the kind carries what it showed,
+      // including the link icon of an internal symlink.
+      const kind=isExternalLink
+        ? t('tree_external_link_aria')
+        : isLk ? t('tree_symlink_aria')
+        : isDirLike ? t('tree_folder_aria') : t('tree_file_aria');
+      // The single tab stop is placed by a11yTreeRestoreFocus() after the render.
+      a11yTreeRow(el, {
+        level: depth+1,
+        expandable: isDirLike,
+        expanded: isDirLike && S._expandedDirs.has(item.path),
+        label: `${kind} ${item.name}`,
+        // What the name's tooltip tells pointer users (symlink target, read
+        // only), with the full target rather than the elided one. The rename
+        // hint is mouse-only.
+        description: isLk&&item.target&&!isExternalLink
+          ? t('symlink_link_to').replace('{target}', () => item.target)
+          : (nameEl.title&&nameEl.title!==t('double_click_rename') ? nameEl.title : ''),
+        path: item.path,
+      });
+    }
+
     container.appendChild(el);
 
     // Render children if directory is expanded
@@ -24682,6 +24767,10 @@ function _renderTreeItems(container, entries, depth){
         empty.className='file-item file-empty';
         empty.style.paddingLeft=(8+(depth+1)*16)+'px';
         empty.textContent=t('empty_dir');
+        // A tree may only contain tree items; announce the placeholder as an
+        // inert one so arrowing into an empty folder says so.
+        // Its path (the folder's, plus "/") lets focus survive a re-render.
+        if(typeof a11yTreeRow==='function') a11yTreeRow(empty,{level:depth+2,disabled:true,path:item.path+'/'});
         container.appendChild(empty);
       }
     }
@@ -24870,6 +24959,7 @@ async function _inlineRenameFileItem(item){
   try{
     await api('/api/file/rename',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,path:item.path,new_name:newName})});
     showToast(t('renamed_to')+newName);
+    _treeRowRenamed(item.path,newName);
     // Update expanded dirs cache key if renaming a directory
     if(isDirLike&&S._expandedDirs){
       S._expandedDirs.delete(item.path);

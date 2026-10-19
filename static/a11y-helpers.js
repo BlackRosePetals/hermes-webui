@@ -93,8 +93,17 @@ function a11yTree(container, opts){
   // screen reader's own navigation - so Tab out and back returns to it.
   container.addEventListener('focusin', (ev) => {
     const target = ev && ev.target;
-    if (target && typeof target.getAttribute === 'function'
-        && target.getAttribute('role') === 'treeitem') _a11yTreeSetTabStop(container, target);
+    if (!target || typeof target.getAttribute !== 'function'
+        || target.getAttribute('role') !== 'treeitem') return;
+    _a11yTreeSetTabStop(container, target);
+    // Focus reaching any other row than the one a partial render fell back
+    // to is the user moving: the position a root refresh carries is dropped
+    // even if they come back. Re-focusing the fallback row itself (by a
+    // passive rebuild in the gap) keeps it.
+    const carried = container._a11yTreeCarry;
+    if (carried && (target.dataset && target.dataset.a11yTreePath) !== carried.fallbackPath) {
+      container._a11yTreeCarry = null;
+    }
   });
 
   container.addEventListener('keydown', (ev) => {
@@ -225,8 +234,10 @@ function a11yTreeReset(container, opts){
  * listings cleared and again when they load. The caller marks that first
  * render as partial ({carry: true}) and the second as completing it
  * ({completesRefill: true}). The missed token is used only by the completing
- * render, and only if the user has not moved off the fallback row in between;
- * any other render in the gap leaves it alone.
+ * render, and only if the user has not moved off the fallback row in between.
+ * Other renders in the gap (a folder listing that arrives meanwhile) replace
+ * every row object, so the fallback is kept as a PATH, not a row: they leave
+ * the token alone. Focus moving to another row drops it (see focusin).
  */
 function a11yTreeRememberFocus(container, opts){
   try {
@@ -239,15 +250,15 @@ function a11yTreeRememberFocus(container, opts){
     // Without focus, still keep the tab stop where the user left it.
     const tracked = container._a11yTreeStop;
     const stop = focusedRow || (tracked && rows.indexOf(tracked) >= 0 ? tracked : null);
+    const pathOf = (r) => (r && r.dataset && r.dataset.a11yTreePath) || null;
+    const path = pathOf(stop);
     const carried = container._a11yTreeCarry;
     if (opts && opts.completesRefill) {
       container._a11yTreeCarry = null;
-      if (carried && stop && stop === carried.fallback) {
+      if (carried && path && path === carried.fallbackPath) {
         return Object.assign({}, carried.token, {hadFocus: hadFocus, carried: true});
       }
     }
-    const pathOf = (r) => (r && r.dataset && r.dataset.a11yTreePath) || null;
-    const path = pathOf(stop);
     if (!path) return null;
     const i = rows.indexOf(stop);
     return {path: path, next: pathOf(rows[i + 1]), prev: pathOf(rows[i - 1]), hadFocus: hadFocus};
@@ -273,7 +284,7 @@ function a11yTreeRestoreFocus(container, token, opts){
       || (token && (byPath(token.next) || byPath(token.prev) || ancestor(token.path)))
       || rows[0];
     if (token && !exact && opts && opts.carry) {
-      container._a11yTreeCarry = {token: token, fallback: target};
+      container._a11yTreeCarry = {token: token, fallbackPath: target.dataset && target.dataset.a11yTreePath};
     }
     _a11yTreeSetTabStop(container, target);
     // Only take focus when the tree had it before - otherwise a background

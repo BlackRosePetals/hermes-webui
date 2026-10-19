@@ -168,7 +168,25 @@ FOCUSED_JS = """() => {
   return (a.tagName || '').toLowerCase() + (a.id ? '#' + a.id : '') + (a.className ? '.' + String(a.className).split(' ')[0] : '');
 }"""
 
-ROW_SEL = "#fileTree [role=treeitem][data-a11y-tree-path=\"{}\"]"
+# Barriers for /api/list responses: __hold(key) makes every list request whose
+# URL contains key wait until __release(key); __unhold() releases everything
+# and stops holding. Installed once; api() goes through window.fetch.
+HOLD_FETCH_JS = """() => {
+  if (window.__hold) return;
+  const original = window.fetch.bind(window);
+  const holds = {};
+  window.__hold = (key) => { holds[key] = holds[key] || []; };
+  window.__release = (key) => { const waiting = holds[key] || []; delete holds[key]; waiting.forEach(go => go()); };
+  window.__unhold = () => Object.keys(holds).forEach(window.__release);
+  window.fetch = (input, init) => {
+    const url = String((input && input.url) || input);
+    const key = url.includes('/api/list?') && Object.keys(holds).find(k => url.includes(k));
+    if (!key) return original(input, init);
+    return new Promise(go => holds[key].push(go)).then(() => original(input, init));
+  };
+}"""
+
+ROW_SEL ="#fileTree [role=treeitem][data-a11y-tree-path=\"{}\"]"
 
 # Count preview opens: openFile is a global function the row handlers call by name.
 COUNT_OPENS_JS = """() => {
@@ -511,6 +529,54 @@ def _check(page, name, workspace):
             fail(f"partial render put focus on {landed}, ArrowDown moved it to {moved_to}, "
                  f"but the completing render moved it to {_focused(page)}")
     page.unroute("**/api/list?*path=alpha*")
+
+    # A folder listing that lands between the two renders of a root refresh
+    # renders the tree once more (new row objects) - that is not the user
+    # moving, so the completing render still brings focus back to the nested
+    # row. Deterministic: listings wait on barriers released from the test.
+    page.evaluate(HOLD_FETCH_JS)
+    page.evaluate("() => { delete S._dirCache['beta']; window.__hold('path=beta'); }")
+    # The delayed expansion of beta starts first, by its real row handler.
+    page.evaluate("() => document.querySelector('#fileTree [data-a11y-tree-path=\"beta\"]').click()")
+    page.focus(ROW_SEL.format("alpha/inner.txt"))
+    page.evaluate("() => { window.__hold('path=alpha');"
+                  " window.__refresh = loadDir('.', {preservePreview: true}); }")
+    if not _wait_until(page, "() => !document.querySelector('#fileTree [data-a11y-tree-path=\"alpha/inner.txt\"]')", timeout_ms=3000):
+        fail("the refresh with a pending folder did not render a partial tree first")
+    else:
+        page.evaluate("() => window.__release('path=beta')")
+        if not _wait_until(page, "() => document.querySelector('#fileTree [data-a11y-tree-path=\"beta\"]')"
+                                 ".getAttribute('aria-expanded') === 'true'", timeout_ms=3000):
+            fail("the delayed beta listing did not render between the refresh's two renders")
+        page.evaluate("() => window.__release('path=alpha')")
+        page.evaluate("() => window.__refresh")
+        if not _wait_for_focus(page, "row:alpha/inner.txt", 3000):
+            fail(f"a folder listing rendered between a refresh's two renders; focus ended on "
+                 f"{_focused(page)}, not alpha/inner.txt")
+    page.evaluate("() => window.__unhold()")
+    page.focus(ROW_SEL.format("beta"))
+    page.keyboard.press("ArrowLeft")
+
+    # Control: moving off the fallback row and back during the gap is the
+    # user's choice, so the completing render leaves focus where they are.
+    page.focus(ROW_SEL.format("alpha/inner.txt"))
+    page.evaluate("() => { window.__hold('path=alpha');"
+                  " window.__refresh = loadDir('.', {preservePreview: true}); }")
+    # The row after alpha/inner.txt (beta) is the partial render's fallback.
+    if not _wait_for_focus(page, "row:beta", 3000):
+        fail(f"the partial render put focus on {_focused(page)}, not beta")
+    else:
+        page.keyboard.press("ArrowDown")
+        page.keyboard.press("ArrowUp")
+        page.evaluate("() => window.__release('path=alpha')")
+        page.evaluate("() => window.__refresh")
+        _wait_until(page, "() => !!document.querySelector('#fileTree [data-a11y-tree-path=\"alpha/inner.txt\"]')", timeout_ms=3000)
+        page.wait_for_timeout(200)
+        if _focused(page) != "row:beta":
+            fail(f"after moving away and back during a refresh, the completing render "
+                 f"moved focus to {_focused(page)}, not left it on beta")
+    page.evaluate("() => window.__unhold()")
+
     page.focus(ROW_SEL.format("alpha"))
     page.keyboard.press("ArrowLeft")
     _wait_until(page, "() => !document.querySelector('#fileTree [data-a11y-tree-path=\"alpha/inner.txt\"]')")

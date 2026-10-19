@@ -170,7 +170,8 @@ FOCUSED_JS = """() => {
 
 # Barriers for /api/list responses: __hold(key) makes every list request whose
 # URL contains key wait until __release(key); __releaseFirst(key) and
-# __releaseLast(key) let only the oldest or newest waiting one through;
+# __releaseLast(key) let only the oldest or newest waiting one through, and
+# __failFirst(key) makes the oldest one fail with a server error;
 # __held(key) counts the waiting ones; __unhold() releases everything and stops
 # holding. __hideInRoot = name drops that entry from root listings, as if it
 # had been deleted. Installed once; api() goes through window.fetch.
@@ -179,9 +180,10 @@ HOLD_FETCH_JS = r"""() => {
   const original = window.fetch.bind(window);
   const holds = {};
   window.__hold = (key) => { holds[key] = holds[key] || []; };
-  window.__release = (key) => { const waiting = holds[key] || []; delete holds[key]; waiting.forEach(go => go()); };
-  window.__releaseFirst = (key) => { const go = (holds[key] || []).shift(); if (go) go(); };
-  window.__releaseLast = (key) => { const go = (holds[key] || []).pop(); if (go) go(); };
+  window.__release = (key) => { const waiting = holds[key] || []; delete holds[key]; waiting.forEach(w => w.go()); };
+  window.__releaseFirst = (key) => { const w = (holds[key] || []).shift(); if (w) w.go(); };
+  window.__releaseLast = (key) => { const w = (holds[key] || []).pop(); if (w) w.go(); };
+  window.__failFirst = (key) => { const w = (holds[key] || []).shift(); if (w) w.fail(); };
   window.__hideInRoot = null;
   const hide = (url, response) => {
     const name = window.__hideInRoot;
@@ -197,7 +199,10 @@ HOLD_FETCH_JS = r"""() => {
     const url = String((input && input.url) || input);
     const key = url.includes('/api/list?') && Object.keys(holds).find(k => url.includes(k));
     if (!key) return original(input, init).then((r) => hide(url, r));
-    return new Promise(go => holds[key].push(go)).then(() => original(input, init));
+    // fail() answers 500, which api() does not retry (a TypeError it would).
+    return new Promise((go) => holds[key].push({go: () => go(true), fail: () => go(false)}))
+      .then((ok) => ok ? original(input, init)
+        : new Response(JSON.stringify({error: 'held request failed'}), {status: 500, headers: {'Content-Type': 'application/json'}}));
   };
 }"""
 
@@ -708,6 +713,40 @@ def _check(page, name, workspace):
             page.wait_for_timeout(200)
             if _focused(page) != "row:alpha/inner.txt":
                 fail(f"the newer refresh completing last moved focus to {_focused(page)}")
+    page.evaluate("() => window.__unhold()")
+
+    # The refresh that completes first cannot show the original row (its
+    # listing failed): it does not use the position up, so the other one,
+    # whose listing loads, still brings it back.
+    if _start_held_refresh():
+        page.evaluate("() => { window.__refresh2 = loadDir('.', {preservePreview: true}); }")
+        if not _wait_until(page, "() => window.__held('path=alpha') >= 2", timeout_ms=3000):
+            fail("the second refresh did not request alpha's listing")
+        else:
+            page.evaluate("() => window.__failFirst('path=alpha')")
+            page.evaluate("() => window.__refresh")
+            page.wait_for_timeout(200)
+            page.evaluate("() => window.__release('path=alpha')")
+            page.evaluate("() => window.__refresh2")
+            if not _wait_for_focus(page, "row:alpha/inner.txt", 3000):
+                fail(f"after the first refresh's listing failed and the second one's loaded, "
+                     f"focus is on {_focused(page)}, not alpha/inner.txt")
+    page.evaluate("() => window.__unhold()")
+
+    # A refresh of another tree (here: a new tree generation, as after a
+    # workspace or session switch) does not carry the old tree's position,
+    # even when its rows have the same paths.
+    if _wait_until(page, "() => !!document.querySelector('#fileTree [data-a11y-tree-path=\"alpha/inner.txt\"]')", timeout_ms=3000):
+        page.focus(ROW_SEL.format("alpha/inner.txt"))
+        page.evaluate("() => { bumpWorkspaceTreeGen(); window.__hold('path=alpha');"
+                      " window.__refresh = loadDir('.', {preservePreview: true}); }")
+        if not _wait_for_focus(page, "row:beta", 3000):
+            fail(f"the new tree's partial render put focus on {_focused(page)}, not beta")
+        else:
+            _finish_held_refresh()
+            if _focused(page) != "row:beta":
+                fail(f"a refresh of a new tree carried the old tree's position: focus moved to "
+                     f"{_focused(page)}, not left on beta")
     page.evaluate("() => window.__unhold()")
 
     # The newer refresh's partial tree has lost the fallback row too (beta

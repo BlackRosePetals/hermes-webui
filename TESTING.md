@@ -336,7 +336,19 @@ file opens its preview exactly once and Space toggles a folder. A background
 re-render must keep the tab stop and never move focus; the end-of-turn
 `loadDir('.')`, which renders once without folder listings and again with
 them, must leave focus on a nested row it was on, while a key pressed between
-the two renders wins. When a row and both its neighbours disappear (its folder
+the two renders wins. Folder listings in these refresh checks wait on
+deterministic barriers (a wrapped `fetch`) instead of timers. The carried
+position must survive a folder listing that renders the tree in between, and
+must give way to any action on the row the partial render fell back to: moving
+off it and back, Right to expand it, a click on it, or its context menu. Keys
+the tree ignores (Ctrl alone, PageDown, a page shortcut) do not count. Focus that left the
+tree in the gap (Shift+Tab, or moved directly) is not taken back, but the tab
+stop still returns to the nested row. With two overlapping refreshes, in either
+completion order, the first one that shows the row again restores it once.
+That also holds when the newer refresh's partial render has lost the fallback
+row too, and when the first refresh to complete failed to load its listing. A
+refresh that is abandoned (the tree generation moved on), or that refreshes a
+new tree generation, never carries the old tree's position. When a row and both its neighbours disappear (its folder
 collapsed), focus goes to the nearest folder above it. A mouse click on a row makes
 it the tab stop. Delete on a row asks for confirmation: cancelling keeps the
 file with focus back on the row, confirming removes it and moves focus to the

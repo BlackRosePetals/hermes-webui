@@ -24384,9 +24384,10 @@ function renderFileTree(opts={}){
   // detaches every row, so the roving tab stop would be rebuilt onto the FIRST
   // row and the keyboard user thrown back to the top of the tree by the very
   // act of expanding a directory. Remembered by entry path (the index shifts
-  // when rows appear), restored after the render tail. A root refresh passes
-  // its refill object as opts.partial on its first render and as
-  // opts.completesRefill on the second (see loadDir).
+  // when rows appear), restored after the render tail. A root load passes
+  // opts.scope naming the tree, and a root refresh its refill object as
+  // opts.partial on its first render and opts.completesRefill on the second
+  // (see loadDir).
   const prevTreeFocus=(typeof a11yTreeRememberFocus==='function')
     ? a11yTreeRememberFocus(box, {completesRefill: (opts&&opts.completesRefill)||null}) : null;
   box.innerHTML='';
@@ -24435,7 +24436,7 @@ function renderFileTree(opts={}){
   // gone, so the tree always keeps exactly one tab stop. A partial render (a
   // root refresh before the expanded folders' listings are back) carries the
   // missed position to the render that completes it.
-  if(typeof a11yTreeRestoreFocus==='function') a11yTreeRestoreFocus(box, prevTreeFocus, {carry: (opts&&opts.partial)||null});
+  if(typeof a11yTreeRestoreFocus==='function') a11yTreeRestoreFocus(box, prevTreeFocus, {carry: (opts&&opts.partial)||null, scope: (opts&&opts.scope)||null});
 }
 
 let _wsActiveDragPath=null;

@@ -1020,10 +1020,12 @@ async function loadDir(path, opts={}){
     // A root refresh cleared the expanded folders' listings; this first render
     // is partial when the block below will render again once they load.
     const refillsExpanded=(!path||path==='.'||refreshExpanded)&&!!(S._expandedDirs&&S._expandedDirs.size);
-    // The scope names this tree: a refill of another session, workspace or
-    // tree generation never takes a position over (a11y-helpers.js).
-    if(refillsExpanded) refill={scope:[sessionId,treeGen,(S.session&&S.session.workspace)||''].join('\n')};
-    S.entries=data.entries||[];renderBreadcrumb();renderFileTree({partial:refill});
+    // The scope names this tree (session, generation, workspace, directory):
+    // a keyboard position is only ever carried within one tree
+    // (a11y-helpers.js).
+    const treeScope=[sessionId,treeGen,(S.session&&S.session.workspace)||'',S.currentDir].join('\n');
+    if(refillsExpanded) refill={scope:treeScope};
+    S.entries=data.entries||[];renderBreadcrumb();renderFileTree({partial:refill,scope:treeScope});
     // #2673 — refresh Artifacts tab when its source data (the file tree) updates.
     if(typeof renderSessionArtifacts==='function') renderSessionArtifacts();
     // Pre-fetch contents of restored expanded dirs so they render without a second click
@@ -1040,7 +1042,7 @@ async function loadDir(path, opts={}){
         if(!S.session||S.session.session_id!==sessionId||treeGen!==_wsTreeGen)return;
         for(const {dirPath,entries} of results) S._dirCache[dirPath]=entries;
       }
-      if(expanded.size>0)renderFileTree({completesRefill:refill});
+      if(expanded.size>0)renderFileTree({completesRefill:refill,scope:treeScope});
     }
     if(!preservePreview&&typeof clearPreview==='function'){
       if(typeof _previewDirty!=='undefined'&&_previewDirty){

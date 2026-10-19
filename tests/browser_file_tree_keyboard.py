@@ -186,7 +186,7 @@ HOLD_FETCH_JS = """() => {
   };
 }"""
 
-ROW_SEL ="#fileTree [role=treeitem][data-a11y-tree-path=\"{}\"]"
+ROW_SEL = "#fileTree [role=treeitem][data-a11y-tree-path=\"{}\"]"
 
 # Count preview opens: openFile is a global function the row handlers call by name.
 COUNT_OPENS_JS = """() => {
@@ -575,6 +575,70 @@ def _check(page, name, workspace):
         if _focused(page) != "row:beta":
             fail(f"after moving away and back during a refresh, the completing render "
                  f"moved focus to {_focused(page)}, not left it on beta")
+    page.evaluate("() => window.__unhold()")
+
+    def _start_held_refresh():
+        """Focus alpha/inner.txt, start a root refresh whose alpha listing is
+        held, and wait for the partial render's fallback (beta). True if it
+        got there."""
+        if not _wait_until(page, "() => !!document.querySelector('#fileTree [data-a11y-tree-path=\"alpha/inner.txt\"]')", timeout_ms=3000):
+            fail("alpha/inner.txt is not shown before a refresh check")
+            return False
+        page.focus(ROW_SEL.format("alpha/inner.txt"))
+        page.evaluate("() => { window.__hold('path=alpha');"
+                      " window.__refresh = loadDir('.', {preservePreview: true}); }")
+        if not _wait_for_focus(page, "row:beta", 3000):
+            fail(f"the partial render put focus on {_focused(page)}, not beta")
+            page.evaluate("() => window.__unhold()")
+            return False
+        return True
+
+    def _finish_held_refresh():
+        page.evaluate("() => window.__release('path=alpha')")
+        page.evaluate("() => window.__refresh")
+        _wait_until(page, "() => !!document.querySelector('#fileTree [data-a11y-tree-path=\"alpha/inner.txt\"]')", timeout_ms=3000)
+        page.wait_for_timeout(200)
+
+    # Acting on the fallback row itself (expanding it) is the user's choice
+    # too, although focus does not move.
+    if _start_held_refresh():
+        page.keyboard.press("ArrowRight")
+        _wait_until(page, "() => document.querySelector('#fileTree [data-a11y-tree-path=\"beta\"]')"
+                          ".getAttribute('aria-expanded') === 'true'", timeout_ms=3000)
+        _finish_held_refresh()
+        if _focused(page) != "row:beta":
+            fail(f"after expanding the fallback row during a refresh, the completing render "
+                 f"moved focus to {_focused(page)}, not left it on beta")
+    page.evaluate("() => window.__unhold()")
+    page.focus(ROW_SEL.format("beta"))
+    page.keyboard.press("ArrowLeft")
+
+    # Focus that left the tree in the gap is not taken back by the carried
+    # position; the tab stop still goes to the nested row.
+    if _start_held_refresh():
+        page.focus("#msg")
+        _finish_held_refresh()
+        if _focused(page) != "textarea#msg":
+            fail(f"a refresh completing while the composer had focus moved it to {_focused(page)}")
+        elif (_row(page, "alpha/inner.txt") or {}).get("tabindex") != "0":
+            fail(f"the completing render did not put the tab stop back on alpha/inner.txt: "
+                 f"{_row(page, 'alpha/inner.txt')}")
+    page.evaluate("() => window.__unhold()")
+
+    # A refill that is abandoned (here: the workspace tree generation moved
+    # on) drops its carried position, so the next, unrelated refresh does not
+    # pick it up and move the user.
+    if _start_held_refresh():
+        page.evaluate("() => { bumpWorkspaceTreeGen(); window.__release('path=alpha'); }")
+        page.evaluate("() => window.__refresh")
+        # The abandoned refill rendered nothing more: still the partial tree.
+        page.evaluate("() => window.__refresh = loadDir('.', {preservePreview: true})")
+        page.evaluate("() => window.__refresh")
+        _wait_until(page, "() => !!document.querySelector('#fileTree [data-a11y-tree-path=\"alpha/inner.txt\"]')", timeout_ms=3000)
+        page.wait_for_timeout(200)
+        if _focused(page) != "row:beta":
+            fail(f"an abandoned refresh's position leaked into the next refresh: focus moved "
+                 f"to {_focused(page)}, not left on beta")
     page.evaluate("() => window.__unhold()")
 
     page.focus(ROW_SEL.format("alpha"))

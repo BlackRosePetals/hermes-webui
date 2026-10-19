@@ -96,17 +96,17 @@ function a11yTree(container, opts){
     if (!target || typeof target.getAttribute !== 'function'
         || target.getAttribute('role') !== 'treeitem') return;
     _a11yTreeSetTabStop(container, target);
-    // Focus reaching any other row than the one a partial render fell back
-    // to is the user moving: the position a root refresh carries is dropped
-    // even if they come back. Re-focusing the fallback row itself (by a
-    // passive rebuild in the gap) keeps it.
-    const carried = container._a11yTreeCarry;
-    if (carried && (target.dataset && target.dataset.a11yTreePath) !== carried.fallbackPath) {
-      container._a11yTreeCarry = null;
-    }
+    // Focus that a rebuild restores is not the user's; any other focus on a
+    // row (arrow keys, Tab back in, a click, the screen reader) is, and the
+    // position a root refresh carries must not override it.
+    if (!container._a11yTreeRestoring) container._a11yTreeCarry = null;
   });
+  // Acting on the row the user is already on (expand, open, delete, rename)
+  // moves no focus, so a key or a press anywhere in the tree also counts.
+  container.addEventListener('pointerdown', () => { container._a11yTreeCarry = null; });
 
   container.addEventListener('keydown', (ev) => {
+    container._a11yTreeCarry = null;
     const key = ev && ev.key;
     if (!key || ev.altKey || ev.ctrlKey || ev.metaKey) return;
     // Focus can sit on the container itself (a click on blank space, a screen
@@ -231,13 +231,15 @@ function a11yTreeReset(container, opts){
  * nearest folder above it that is still shown, then the first row.
  *
  * A miss can be temporary: a root refresh renders once with the folder
- * listings cleared and again when they load. The caller marks that first
- * render as partial ({carry: true}) and the second as completing it
- * ({completesRefill: true}). The missed token is used only by the completing
- * render, and only if the user has not moved off the fallback row in between.
- * Other renders in the gap (a folder listing that arrives meanwhile) replace
- * every row object, so the fallback is kept as a PATH, not a row: they leave
- * the token alone. Focus moving to another row drops it (see focusin).
+ * listings cleared and again when they load. The refresh passes one object
+ * that identifies it to both renders: {carry: refill} on the partial one and
+ * {completesRefill: refill} on the completing one. The missed token belongs
+ * to that refill. Only its own completing render uses it, and only while the
+ * tab stop is still the fallback row (compared by path: other renders in the
+ * gap, such as a folder listing that arrives meanwhile, replace every row
+ * object but leave the token alone). Any user action in the tree drops it
+ * (see a11yTree), and the refill drops it on every other exit
+ * (a11yTreeDropCarry), so it never reaches a later, unrelated refill.
  */
 function a11yTreeRememberFocus(container, opts){
   try {
@@ -253,9 +255,9 @@ function a11yTreeRememberFocus(container, opts){
     const pathOf = (r) => (r && r.dataset && r.dataset.a11yTreePath) || null;
     const path = pathOf(stop);
     const carried = container._a11yTreeCarry;
-    if (opts && opts.completesRefill) {
+    if (opts && opts.completesRefill && carried && carried.refill === opts.completesRefill) {
       container._a11yTreeCarry = null;
-      if (carried && path && path === carried.fallbackPath) {
+      if (path && path === carried.fallbackPath) {
         return Object.assign({}, carried.token, {hadFocus: hadFocus, carried: true});
       }
     }
@@ -284,19 +286,33 @@ function a11yTreeRestoreFocus(container, token, opts){
       || (token && (byPath(token.next) || byPath(token.prev) || ancestor(token.path)))
       || rows[0];
     if (token && !exact && opts && opts.carry) {
-      container._a11yTreeCarry = {token: token, fallbackPath: target.dataset && target.dataset.a11yTreePath};
+      container._a11yTreeCarry = {
+        token: token,
+        refill: opts.carry,
+        fallbackPath: target.dataset && target.dataset.a11yTreePath,
+      };
     }
     _a11yTreeSetTabStop(container, target);
     // Only take focus when the tree had it before - otherwise a background
     // refresh would steal focus from whatever the user is doing elsewhere. The
     // scroll position was already restored by the caller.
     if (token && token.hadFocus && typeof target.focus === 'function') {
-      target.focus({preventScroll: true});
+      // Marked, so the focusin it fires is not taken for the user moving.
+      container._a11yTreeRestoring = true;
+      try { target.focus({preventScroll: true}); } finally { container._a11yTreeRestoring = false; }
       // A carried position comes back after a shorter partial render clamped
       // the scroll offset, so bring the row into view if it ended up outside.
       if (token.carried && typeof target.scrollIntoView === 'function') target.scrollIntoView({block: 'nearest'});
     }
   } catch (_e) { /* a rebuild must never fail because of focus bookkeeping */ }
+}
+
+/* A refill that ends without its completing render (aborted, failed, nothing
+ * left expanded) drops the position it carries, if it still owns it. */
+function a11yTreeDropCarry(container, refill){
+  if (container && container._a11yTreeCarry && container._a11yTreeCarry.refill === refill) {
+    container._a11yTreeCarry = null;
+  }
 }
 
 if (typeof window !== 'undefined') {
@@ -306,4 +322,5 @@ if (typeof window !== 'undefined') {
   window.a11yTreeReset = a11yTreeReset;
   window.a11yTreeRememberFocus = a11yTreeRememberFocus;
   window.a11yTreeRestoreFocus = a11yTreeRestoreFocus;
+  window.a11yTreeDropCarry = a11yTreeDropCarry;
 }

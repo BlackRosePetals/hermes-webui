@@ -57,7 +57,7 @@ def test_tree_container_is_not_a_tab_stop_of_its_own():
 
 def test_helpers_are_exported():
     for name in ("a11yLabel", "a11yTree", "a11yTreeRow", "a11yTreeReset",
-                 "a11yTreeRememberFocus", "a11yTreeRestoreFocus"):
+                 "a11yTreeRememberFocus", "a11yTreeRestoreFocus", "a11yTreeDropCarry"):
         assert f"window.{name} = {name};" in A11Y_JS
 
 

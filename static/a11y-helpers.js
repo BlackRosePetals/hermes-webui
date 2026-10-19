@@ -104,13 +104,14 @@ function a11yTree(container, opts){
   // Acting on the row the user is already on moves no focus, so these count
   // too: a click (also a tap, and a screen reader's activation such as NVDA
   // browse-mode Enter or a VoiceOver double-tap, which send no key; scrolling
-  // sends none), opening the context menu (Rename, Copy... act from there),
-  // starting a drag, a key the tree handled (see the listener after the key
-  // handler below), and typing into a control inside a row (the rename
-  // input). Other keys - a modifier alone (Ctrl silences NVDA), Tab, Escape,
-  // page shortcuts - do not act on the tree.
+  // sends none) or a middle click, opening the context menu (Rename, Copy...
+  // act from there), starting a drag or dropping files on a row, a key the
+  // tree handled (see the listener after the key handler below), and typing
+  // into a control inside a row (the rename input). Other keys - a modifier
+  // alone (Ctrl silences NVDA), Tab, Escape, page shortcuts - do not act on
+  // the tree.
   const drop = () => { container._a11yTreeCarry = null; };
-  ['click', 'contextmenu', 'dragstart'].forEach((type) => container.addEventListener(type, drop, true));
+  ['click', 'auxclick', 'contextmenu', 'dragstart', 'drop'].forEach((type) => container.addEventListener(type, drop, true));
 
   container.addEventListener('keydown', (ev) => {
     const key = ev && ev.key;
@@ -250,7 +251,7 @@ function a11yTreeReset(container, opts){
  * listings cleared and again when they load. The refresh passes one object
  * that identifies it to both renders: {carry: refill} on the partial one and
  * {completesRefill: refill} on the completing one. Every root render also
- * passes {scope} naming the tree (session, workspace, generation): a token
+ * passes {scope} naming the tree (session, generation, workspace): a token
  * is carried only from rows of the same tree. It is carried for that refill
  * and used by a completing render of a refill that carries it, while the tab
  * stop is still the fallback row (compared by path: other renders in the

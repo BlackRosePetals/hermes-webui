@@ -1020,11 +1020,11 @@ async function loadDir(path, opts={}){
     // A root refresh cleared the expanded folders' listings; this first render
     // is partial when the block below will render again once they load.
     const refillsExpanded=(!path||path==='.'||refreshExpanded)&&!!(S._expandedDirs&&S._expandedDirs.size);
-    // The scope names this tree (session, generation, workspace, directory):
-    // a keyboard position is only ever carried within one tree
-    // (a11y-helpers.js).
-    const treeScope=[sessionId,treeGen,(S.session&&S.session.workspace)||'',S.currentDir].join('\n');
-    if(refillsExpanded) refill={scope:treeScope};
+    // The scope names this tree (session, generation, workspace): a keyboard
+    // position is only ever carried within one tree (a11y-helpers.js). Row
+    // paths are workspace-relative, so the folder shown does not matter.
+    const treeScope=[sessionId,treeGen,(S.session&&S.session.workspace)||''].join('\n');
+    if(refillsExpanded) refill={};
     S.entries=data.entries||[];renderBreadcrumb();renderFileTree({partial:refill,scope:treeScope});
     // #2673 — refresh Artifacts tab when its source data (the file tree) updates.
     if(typeof renderSessionArtifacts==='function') renderSessionArtifacts();

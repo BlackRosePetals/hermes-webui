@@ -169,23 +169,34 @@ FOCUSED_JS = """() => {
 }"""
 
 # Barriers for /api/list responses: __hold(key) makes every list request whose
-# URL contains key wait until __release(key); __releaseLast(key) lets only the
-# newest waiting one through; __held(key) counts the waiting ones; __unhold()
-# releases everything and stops holding. Installed once; api() goes through
-# window.fetch.
-HOLD_FETCH_JS = """() => {
+# URL contains key wait until __release(key); __releaseFirst(key) and
+# __releaseLast(key) let only the oldest or newest waiting one through;
+# __held(key) counts the waiting ones; __unhold() releases everything and stops
+# holding. __hideInRoot = name drops that entry from root listings, as if it
+# had been deleted. Installed once; api() goes through window.fetch.
+HOLD_FETCH_JS = r"""() => {
   if (window.__hold) return;
   const original = window.fetch.bind(window);
   const holds = {};
   window.__hold = (key) => { holds[key] = holds[key] || []; };
   window.__release = (key) => { const waiting = holds[key] || []; delete holds[key]; waiting.forEach(go => go()); };
+  window.__releaseFirst = (key) => { const go = (holds[key] || []).shift(); if (go) go(); };
   window.__releaseLast = (key) => { const go = (holds[key] || []).pop(); if (go) go(); };
+  window.__hideInRoot = null;
+  const hide = (url, response) => {
+    const name = window.__hideInRoot;
+    if (!name || !/[?&]path=\.(&|$)/.test(url)) return response;
+    return response.clone().json().then((data) => {
+      data.entries = (data.entries || []).filter((e) => e.name !== name);
+      return new Response(JSON.stringify(data), {status: response.status, headers: response.headers});
+    });
+  };
   window.__held = (key) => (holds[key] || []).length;
   window.__unhold = () => Object.keys(holds).forEach(window.__release);
   window.fetch = (input, init) => {
     const url = String((input && input.url) || input);
     const key = url.includes('/api/list?') && Object.keys(holds).find(k => url.includes(k));
-    if (!key) return original(input, init);
+    if (!key) return original(input, init).then((r) => hide(url, r));
     return new Promise(go => holds[key].push(go)).then(() => original(input, init));
   };
 }"""
@@ -631,13 +642,29 @@ def _check(page, name, workspace):
     page.focus(ROW_SEL.format("beta"))
     page.keyboard.press("ArrowLeft")
 
-    # A modifier alone (Ctrl silences NVDA's speech) is not a move.
+    # Keys the tree does not act on - a modifier alone (Ctrl silences NVDA's
+    # speech), PageDown, a page shortcut - are not a move.
     if _start_held_refresh():
         page.keyboard.press("Control")
+        page.keyboard.press("PageDown")
+        page.keyboard.press("Control+KeyB")
         _finish_held_refresh()
         if _focused(page) != "row:alpha/inner.txt":
-            fail(f"pressing Ctrl during a refresh dropped the carried position: focus is on "
-                 f"{_focused(page)}, not alpha/inner.txt")
+            fail(f"keys the tree ignores dropped the carried position during a refresh: focus "
+                 f"is on {_focused(page)}, not alpha/inner.txt")
+    page.evaluate("() => window.__unhold()")
+
+    # Opening the context menu on the fallback row (to rename or copy from it)
+    # is acting on it: focus stays there.
+    if _start_held_refresh():
+        page.click(ROW_SEL.format("beta"), button="right")
+        if not _wait_until(page, "() => !!document.querySelector('.file-ctx-menu')", timeout_ms=2000):
+            fail("right-click on the fallback row opened no context menu")
+        _finish_held_refresh()
+        page.evaluate("() => document.querySelectorAll('.file-ctx-menu').forEach(m => m.remove())")
+        if _focused(page) != "row:beta":
+            fail(f"after opening the context menu on the fallback row during a refresh, the "
+                 f"completing render moved focus to {_focused(page)}, not left it on beta")
     page.evaluate("() => window.__unhold()")
 
     # Focus that left the tree in the gap (by Shift+Tab, as a keyboard user
@@ -663,9 +690,42 @@ def _check(page, name, workspace):
                  f"back on alpha/inner.txt: {_row(page, 'alpha/inner.txt')}")
         page.evaluate("() => window.__unhold()")
 
-    # Two overlapping refreshes: the newer one takes the carried position over,
-    # so whichever shows the original row first restores it, and the older one
-    # completing later does not move focus again.
+    # Two overlapping refreshes, in both completion orders: the newer one joins
+    # the carried position, so whichever shows the original row first restores
+    # it, and the other completing later does not move focus again.
+    if _start_held_refresh():
+        page.evaluate("() => { window.__refresh2 = loadDir('.', {preservePreview: true}); }")
+        if not _wait_until(page, "() => window.__held('path=alpha') >= 2", timeout_ms=3000):
+            fail("the second refresh did not request alpha's listing")
+        else:
+            page.evaluate("() => window.__releaseFirst('path=alpha')")
+            page.evaluate("() => window.__refresh")
+            if not _wait_for_focus(page, "row:alpha/inner.txt", 3000):
+                fail(f"the older refresh completed first but left focus on {_focused(page)}, "
+                     f"not alpha/inner.txt")
+            page.evaluate("() => window.__release('path=alpha')")
+            page.evaluate("() => window.__refresh2")
+            page.wait_for_timeout(200)
+            if _focused(page) != "row:alpha/inner.txt":
+                fail(f"the newer refresh completing last moved focus to {_focused(page)}")
+    page.evaluate("() => window.__unhold()")
+
+    # The newer refresh's partial tree has lost the fallback row too (beta
+    # deleted meanwhile): the original position still comes back.
+    if _start_held_refresh():
+        page.evaluate("() => { window.__hideInRoot = 'beta';"
+                      " window.__refresh2 = loadDir('.', {preservePreview: true}); }")
+        if not _wait_until(page, "() => window.__held('path=alpha') >= 2", timeout_ms=3000):
+            fail("the second refresh did not request alpha's listing")
+        else:
+            page.evaluate("() => { window.__hideInRoot = null; window.__release('path=alpha'); }")
+            page.evaluate("() => Promise.all([window.__refresh, window.__refresh2])")
+            if not _wait_for_focus(page, "row:alpha/inner.txt", 3000):
+                fail(f"when the fallback row vanished in a newer refresh, focus ended on "
+                     f"{_focused(page)}, not alpha/inner.txt")
+    page.evaluate("() => { window.__hideInRoot = null; window.__unhold(); }")
+    page.evaluate("() => loadDir('.', {preservePreview: true})")
+
     if _start_held_refresh():
         page.evaluate("() => { window.__refresh2 = loadDir('.', {preservePreview: true}); }")
         if not _wait_until(page, "() => window.__held('path=alpha') >= 2", timeout_ms=3000):
@@ -684,20 +744,28 @@ def _check(page, name, workspace):
     page.evaluate("() => window.__unhold()")
 
     # A refill that is abandoned (here: the workspace tree generation moved
-    # on) drops its carried position, so the next, unrelated refresh does not
-    # pick it up and move the user.
-    if _start_held_refresh():
-        page.evaluate("() => { bumpWorkspaceTreeGen(); window.__release('path=alpha'); }")
+    # on, as on a workspace switch) drops its carried position, and a refresh
+    # of the new tree - started before or after the old one gives up - does
+    # not take it over and move the user.
+    for started in ("after", "before"):
+        if not _start_held_refresh():
+            continue
+        page.evaluate("() => bumpWorkspaceTreeGen()")
+        if started == "before":
+            page.evaluate("() => { window.__refresh2 = loadDir('.', {preservePreview: true}); }")
+            _wait_until(page, "() => window.__held('path=alpha') >= 2", timeout_ms=3000)
+        page.evaluate("() => window.__release('path=alpha')")
         page.evaluate("() => window.__refresh")
-        # The abandoned refill rendered nothing more: still the partial tree.
-        page.evaluate("() => window.__refresh = loadDir('.', {preservePreview: true})")
-        page.evaluate("() => window.__refresh")
+        if started == "after":
+            # The abandoned refill rendered nothing more: still the partial tree.
+            page.evaluate("() => { window.__refresh2 = loadDir('.', {preservePreview: true}); }")
+        page.evaluate("() => window.__refresh2")
         _wait_until(page, "() => !!document.querySelector('#fileTree [data-a11y-tree-path=\"alpha/inner.txt\"]')", timeout_ms=3000)
         page.wait_for_timeout(200)
         if _focused(page) != "row:beta":
-            fail(f"an abandoned refresh's position leaked into the next refresh: focus moved "
-                 f"to {_focused(page)}, not left on beta")
-    page.evaluate("() => window.__unhold()")
+            fail(f"an abandoned refresh's position leaked into a refresh started {started} it "
+                 f"gave up: focus moved to {_focused(page)}, not left on beta")
+        page.evaluate("() => window.__unhold()")
 
     page.focus(ROW_SEL.format("alpha"))
     page.keyboard.press("ArrowLeft")

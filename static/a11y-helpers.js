@@ -102,11 +102,16 @@ function a11yTree(container, opts){
     if (!container._a11yTreeRestoring) container._a11yTreeCarry = null;
   });
   // Acting on the row the user is already on (expand, open, delete, rename)
-  // moves no focus, so a key or a press anywhere in the tree also counts.
-  container.addEventListener('pointerdown', () => { container._a11yTreeCarry = null; });
+  // moves no focus, so a key or a click in the tree counts too. A click also
+  // covers a tap and a screen reader's activation (NVDA browse-mode Enter,
+  // VoiceOver double-tap), which send no key; it is not sent for scrolling.
+  // Keys that do not act - modifiers alone (Ctrl silences NVDA), Tab and
+  // Escape leaving the tree - do not count.
+  const passiveKeys = ['Shift', 'Control', 'Alt', 'AltGraph', 'Meta', 'CapsLock', 'NumLock', 'Tab', 'Escape'];
+  container.addEventListener('click', () => { container._a11yTreeCarry = null; }, true);
 
   container.addEventListener('keydown', (ev) => {
-    container._a11yTreeCarry = null;
+    if (ev && !passiveKeys.includes(ev.key)) container._a11yTreeCarry = null;
     const key = ev && ev.key;
     if (!key || ev.altKey || ev.ctrlKey || ev.metaKey) return;
     // Focus can sit on the container itself (a click on blank space, a screen
@@ -237,9 +242,12 @@ function a11yTreeReset(container, opts){
  * to that refill. Only its own completing render uses it, and only while the
  * tab stop is still the fallback row (compared by path: other renders in the
  * gap, such as a folder listing that arrives meanwhile, replace every row
- * object but leave the token alone). Any user action in the tree drops it
- * (see a11yTree), and the refill drops it on every other exit
- * (a11yTreeDropCarry), so it never reaches a later, unrelated refill.
+ * object but leave the token alone). A newer refill whose partial render
+ * finds the user still on the fallback row takes the token over, so the
+ * first refill to show the original row again restores it and an older one
+ * that completes later cannot move focus. Any user action in the tree drops
+ * it (see a11yTree), and a refill drops it on every other exit
+ * (a11yTreeDropCarry), so an abandoned refill's token is never taken over.
  */
 function a11yTreeRememberFocus(container, opts){
   try {
@@ -285,12 +293,12 @@ function a11yTreeRestoreFocus(container, token, opts){
     const target = exact
       || (token && (byPath(token.next) || byPath(token.prev) || ancestor(token.path)))
       || rows[0];
+    const targetPath = target.dataset && target.dataset.a11yTreePath;
+    const carried = container._a11yTreeCarry;
     if (token && !exact && opts && opts.carry) {
-      container._a11yTreeCarry = {
-        token: token,
-        refill: opts.carry,
-        fallbackPath: target.dataset && target.dataset.a11yTreePath,
-      };
+      container._a11yTreeCarry = {token: token, refill: opts.carry, fallbackPath: targetPath};
+    } else if (carried && opts && opts.carry && targetPath === carried.fallbackPath) {
+      carried.refill = opts.carry;
     }
     _a11yTreeSetTabStop(container, target);
     // Only take focus when the tree had it before - otherwise a background

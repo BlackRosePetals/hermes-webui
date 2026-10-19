@@ -169,14 +169,18 @@ FOCUSED_JS = """() => {
 }"""
 
 # Barriers for /api/list responses: __hold(key) makes every list request whose
-# URL contains key wait until __release(key); __unhold() releases everything
-# and stops holding. Installed once; api() goes through window.fetch.
+# URL contains key wait until __release(key); __releaseLast(key) lets only the
+# newest waiting one through; __held(key) counts the waiting ones; __unhold()
+# releases everything and stops holding. Installed once; api() goes through
+# window.fetch.
 HOLD_FETCH_JS = """() => {
   if (window.__hold) return;
   const original = window.fetch.bind(window);
   const holds = {};
   window.__hold = (key) => { holds[key] = holds[key] || []; };
   window.__release = (key) => { const waiting = holds[key] || []; delete holds[key]; waiting.forEach(go => go()); };
+  window.__releaseLast = (key) => { const go = (holds[key] || []).pop(); if (go) go(); };
+  window.__held = (key) => (holds[key] || []).length;
   window.__unhold = () => Object.keys(holds).forEach(window.__release);
   window.fetch = (input, init) => {
     const url = String((input && input.url) || input);
@@ -613,16 +617,70 @@ def _check(page, name, workspace):
     page.focus(ROW_SEL.format("beta"))
     page.keyboard.press("ArrowLeft")
 
-    # Focus that left the tree in the gap is not taken back by the carried
-    # position; the tab stop still goes to the nested row.
+    # Activating the fallback row without a key or pointer (a screen reader's
+    # browse-mode Enter or double-tap sends only a click) is an action too.
     if _start_held_refresh():
-        page.focus("#msg")
+        page.evaluate("() => document.querySelector('#fileTree [data-a11y-tree-path=\"beta\"]').click()")
+        _wait_until(page, "() => document.querySelector('#fileTree [data-a11y-tree-path=\"beta\"]')"
+                          ".getAttribute('aria-expanded') === 'true'", timeout_ms=3000)
         _finish_held_refresh()
-        if _focused(page) != "textarea#msg":
-            fail(f"a refresh completing while the composer had focus moved it to {_focused(page)}")
+        if _focused(page) != "row:beta":
+            fail(f"after activating the fallback row by click during a refresh, the completing "
+                 f"render moved focus to {_focused(page)}, not left it on beta")
+    page.evaluate("() => window.__unhold()")
+    page.focus(ROW_SEL.format("beta"))
+    page.keyboard.press("ArrowLeft")
+
+    # A modifier alone (Ctrl silences NVDA's speech) is not a move.
+    if _start_held_refresh():
+        page.keyboard.press("Control")
+        _finish_held_refresh()
+        if _focused(page) != "row:alpha/inner.txt":
+            fail(f"pressing Ctrl during a refresh dropped the carried position: focus is on "
+                 f"{_focused(page)}, not alpha/inner.txt")
+    page.evaluate("() => window.__unhold()")
+
+    # Focus that left the tree in the gap (by Shift+Tab, as a keyboard user
+    # does - the tree is the page's last Tab stop and headless Firefox does not
+    # Tab out of the document - and by moving it directly) is not taken back
+    # by the carried position; the tab stop still goes to the nested row.
+    for how in ("Shift+Tab", "focus"):
+        if not _start_held_refresh():
+            continue
+        if how == "Shift+Tab":
+            page.keyboard.press("Shift+Tab")
+        else:
+            page.focus("#msg")
+        left_to = _focused(page)
+        _finish_held_refresh()
+        if (left_to or "").startswith("row:"):
+            fail(f"{how} out of the tree did not leave it: {left_to}")
+        elif _focused(page) != left_to:
+            fail(f"a refresh completing after {how} out of the tree moved focus from {left_to} "
+                 f"to {_focused(page)}")
         elif (_row(page, "alpha/inner.txt") or {}).get("tabindex") != "0":
-            fail(f"the completing render did not put the tab stop back on alpha/inner.txt: "
-                 f"{_row(page, 'alpha/inner.txt')}")
+            fail(f"after {how} out of the tree the completing render did not put the tab stop "
+                 f"back on alpha/inner.txt: {_row(page, 'alpha/inner.txt')}")
+        page.evaluate("() => window.__unhold()")
+
+    # Two overlapping refreshes: the newer one takes the carried position over,
+    # so whichever shows the original row first restores it, and the older one
+    # completing later does not move focus again.
+    if _start_held_refresh():
+        page.evaluate("() => { window.__refresh2 = loadDir('.', {preservePreview: true}); }")
+        if not _wait_until(page, "() => window.__held('path=alpha') >= 2", timeout_ms=3000):
+            fail("the second refresh did not request alpha's listing")
+        else:
+            page.evaluate("() => window.__releaseLast('path=alpha')")
+            page.evaluate("() => window.__refresh2")
+            if not _wait_for_focus(page, "row:alpha/inner.txt", 3000):
+                fail(f"the newer refresh completed first but left focus on {_focused(page)}, "
+                     f"not alpha/inner.txt")
+            page.evaluate("() => window.__release('path=alpha')")
+            page.evaluate("() => window.__refresh")
+            page.wait_for_timeout(200)
+            if _focused(page) != "row:alpha/inner.txt":
+                fail(f"the older refresh completing last moved focus to {_focused(page)}")
     page.evaluate("() => window.__unhold()")
 
     # A refill that is abandoned (here: the workspace tree generation moved

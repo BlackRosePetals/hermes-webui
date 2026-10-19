@@ -67,6 +67,10 @@ function a11yTree(container, opts){
   // The container persists across renders, so set the name on every render
   // (after a language switch the next render renames it).
   if (o.label) container.setAttribute('aria-label', String(o.label));
+  // The tree's only Tab stop is its roving row. A scrolling container is a
+  // Tab stop of its own in Firefox (and in Chromium when nothing inside is
+  // focusable), so the container opts out.
+  container.setAttribute('tabindex', '-1');
   if (container.dataset && container.dataset.a11yTreeBound === '1') return container;
   if (container.dataset) container.dataset.a11yTreeBound = '1';
   if (typeof container.addEventListener !== 'function') return container;
@@ -96,6 +100,25 @@ function a11yTree(container, opts){
   container.addEventListener('keydown', (ev) => {
     const key = ev && ev.key;
     if (!key || ev.altKey || ev.ctrlKey || ev.metaKey) return;
+    // Focus can sit on the container itself (a click on blank space, a screen
+    // reader moving there): it is click-focusable since it has tabindex=-1. A
+    // navigation key there enters the tree at its tab stop - or at the
+    // first/last row for Home/End - instead of doing nothing. Enter and Space
+    // only enter the tree too: nothing is activated, and the key is consumed,
+    // so a document-level Enter shortcut (Allow once on a pending approval)
+    // cannot read the focused tree as "no control focused". Failing closed
+    // costs a mouse user who clicked blank tree space one extra Enter.
+    if (ev.target === container) {
+      if (!['ArrowDown', 'ArrowUp', 'ArrowRight', 'ArrowLeft', 'Home', 'End', 'Enter', ' '].includes(key)) return;
+      ev.preventDefault();
+      const items = rows();
+      if (!items.length) return;
+      const stop = container._a11yTreeStop;
+      if (key === 'Home') moveFocus(items[0]);
+      else if (key === 'End') moveFocus(items[items.length - 1]);
+      else moveFocus(stop && container.contains(stop) ? stop : items[0]);
+      return;
+    }
     // Only keys pressed ON a row are tree navigation. Keys typed into a control
     // inside a row (the inline rename input) belong to that control.
     const current = ev.target;
@@ -142,6 +165,9 @@ function a11yTree(container, opts){
     }
     if (key === 'Enter' || key === ' ') {
       ev.preventDefault();
+      // A held key must not open or toggle rows over and over (nor act on the
+      // row a first press on the container just moved to).
+      if (ev.repeat) return;
       if (current.getAttribute('aria-disabled') === 'true') return;
       if (expandable) toggle(current);
       else if (typeof current.click === 'function') current.click();
@@ -160,11 +186,21 @@ function _a11yTreeSetTabStop(container, target){
 }
 
 /* The container no longer holds rows (empty folder, skeleton, no session):
- * it is not a tree, and a generic element must not keep the tree's name. */
-function a11yTreeReset(container){
+ * it is not a tree, and a generic element must not keep the tree's name.
+ * Call it before wiping the rows: focus inside the tree (or opts.hadFocus,
+ * for a caller that already wiped them) moves to opts.focusTo instead of
+ * dropping to <body>. */
+function a11yTreeReset(container, opts){
   if (!container || typeof container.removeAttribute !== 'function') return;
+  const o = opts || {};
+  const active = (typeof document !== 'undefined' && document.activeElement) || null;
+  const hadFocus = !!o.hadFocus || (!!active && (active === container
+    || (typeof container.contains === 'function' && container.contains(active))));
+  if (hadFocus && o.focusTo && typeof o.focusTo.focus === 'function') o.focusTo.focus();
   container.removeAttribute('role');
   container.removeAttribute('aria-label');
+  // tabindex=-1 stays: an overflowing skeleton must not become a Firefox
+  // scroller Tab stop either.
   container._a11yTreeStop = null;
   container._a11yTreeCarry = null;
 }

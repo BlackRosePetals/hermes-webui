@@ -24280,9 +24280,9 @@ function renderFileTree(opts={}){
   // No rows will be rendered: the container is not a tree any more, and focus
   // that was on a row goes to the Files tab instead of dropping to <body>.
   const treeEmptied=()=>{
-    if(typeof a11yTreeReset==='function') a11yTreeReset(box);
-    const tab=$('workspaceFilesTab');
-    if(prevTreeFocus&&prevTreeFocus.hadFocus&&tab&&typeof tab.focus==='function') tab.focus();
+    if(typeof a11yTreeReset==='function') a11yTreeReset(box,{
+      hadFocus: !!(prevTreeFocus&&prevTreeFocus.hadFocus), focusTo: $('workspaceFilesTab'),
+    });
   };
   // Cache current dir entries
   S._dirCache[S.currentDir||'.']=S.entries;
@@ -24292,8 +24292,9 @@ function renderFileTree(opts={}){
   if(!hasWorkspace){
     _syncWorkspaceBirthtimeSupportScope('');
     if(emptyEl){emptyEl.textContent=t('workspace_empty_no_path');emptyEl.style.display='flex';}
-    box.style.display='none';
+    // Before hiding the box: a hidden element may already have lost focus.
     treeEmptied();
+    box.style.display='none';
     return;
   }
   _noteWorkspaceBirthtimeSupport(S.entries);
@@ -24492,6 +24493,29 @@ function _treeDeleteButtonA11y(row, del, name){
   });
 }
 
+// The size column's "1.5k" reads badly aloud ("0.0k" for small files, a
+// bare letter k); speak it as "1.5 kilobytes" in the UI language instead.
+// Like the column (and Windows Explorer), one kilobyte here is 1024 bytes.
+const _TREE_SIZE_UNITS=['byte','kilobyte','megabyte','gigabyte','terabyte'];
+const _treeSizeFormatters=new Map();
+function _treeSizeSpeech(bytes, fallback){
+  let value=Number(bytes)||0, i=0;
+  // Compare the value as it will be shown (one decimal), so 1023.99 KB reads
+  // "1 megabyte", not "1,024 kilobytes".
+  while(Math.round(value*10)/10>=1024&&i<_TREE_SIZE_UNITS.length-1){value/=1024;i++;}
+  const lang=(document.documentElement&&document.documentElement.lang)||'';
+  const key=lang+'|'+_TREE_SIZE_UNITS[i];
+  if(!_treeSizeFormatters.has(key)){
+    let fmt=null;
+    try{
+      fmt=new Intl.NumberFormat(lang||undefined,{style:'unit',unit:_TREE_SIZE_UNITS[i],unitDisplay:'long',maximumFractionDigits:1});
+    }catch(_e){ /* no unit support: remember that, use the column text */ }
+    _treeSizeFormatters.set(key,fmt);
+  }
+  const fmt=_treeSizeFormatters.get(key);
+  return fmt ? fmt.format(value) : fallback;
+}
+
 // Point the renamed row at its new path before the re-render, so the keyboard
 // position follows the entry instead of falling to a neighbour.
 function _treeRowRenamed(oldPath, newName){
@@ -24550,7 +24574,7 @@ function _renderTreeItems(container, entries, depth){
     // Icon
     const iconEl=document.createElement('span');
     iconEl.className='file-icon';
-    // The entry kind is in the row's accessible name ("folder .cache").
+    // The entry kind is in the row's accessible name (".cache folder").
     iconEl.setAttribute('aria-hidden','true');
     iconEl.innerHTML = isExternalLink
       ? li('external-link', 14)
@@ -24655,10 +24679,12 @@ function _renderTreeItems(container, entries, depth){
     el.appendChild(nameEl);
 
     // Size -- for real files and symlinks that resolve to files
+    let sizeText='';
     if(isFileLike&&item.size){
+      sizeText=`${(item.size/1024).toFixed(1)}k`;
       const sizeEl=document.createElement('span');
       sizeEl.className='file-size';
-      sizeEl.textContent=`${(item.size/1024).toFixed(1)}k`;
+      sizeEl.textContent=sizeText;
       el.appendChild(sizeEl);
     }
 
@@ -24744,7 +24770,9 @@ function _renderTreeItems(container, entries, depth){
         level: depth+1,
         expandable: isDirLike,
         expanded: isDirLike && S._expandedDirs.has(item.path),
-        label: `${kind} ${item.name}`,
+        // Name first, then the kind and the size, so a screen reader says
+        // what matters most first (word order is up to each locale).
+        label: t('tree_row_aria', item.name, kind, sizeText ? _treeSizeSpeech(item.size, sizeText) : ''),
         // What the name's tooltip tells pointer users (symlink target, read
         // only), with the full target rather than the elided one. The rename
         // hint is mouse-only.

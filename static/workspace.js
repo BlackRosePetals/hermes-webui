@@ -966,8 +966,8 @@ function showWorkspaceTreeSkeleton(){
     }
     wrap.appendChild(row);
   }
+  if(typeof a11yTreeReset==='function') a11yTreeReset(tree, {focusTo: $('workspaceFilesTab')});
   tree.innerHTML = '';
-  if(typeof a11yTreeReset==='function') a11yTreeReset(tree);
   tree.appendChild(wrap);
   tree.style.display = '';
 }
@@ -981,10 +981,7 @@ function showWorkspaceTreeSkeleton(){
 function clearWorkspaceTreeSkeleton(){
   const tree = $('fileTree');
   if(!tree) return;
-  if(tree.querySelector('.skeleton-tree')){
-    tree.innerHTML = '';
-    if(typeof a11yTreeReset==='function') a11yTreeReset(tree);
-  }
+  if(tree.querySelector('.skeleton-tree')) tree.innerHTML = '';
 }
 
 async function loadDir(path, opts={}){

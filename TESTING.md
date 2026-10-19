@@ -313,12 +313,21 @@ It then runs `tests/browser_file_tree_keyboard.py`, which starts the server with
 a temporary default workspace and drives the Files tab from the keyboard in
 Chromium, and in Firefox when Playwright's build is installed. The container
 must be `role="tree"` with a name, every row a `treeitem` with `aria-level`,
-folders with `aria-expanded` and files without it, names reading "folder x",
-"file y" or "symlink z" (a symlink also describes its target), and the arrow
+folders with `aria-expanded` and files without it, names reading "x folder",
+"y file, 1.5 kilobytes" (name first, then the kind and the size, spoken in
+the UI language rather than the "1.5k" column text) or "z symlink"
+(a symlink also describes its target), and the arrow
 glyph and icon hidden from screen readers. The tree must be a single Tab stop: Tab reaches one row and the next
 Tab leaves the tree, and the delete buttons are out of the Tab order, named
-"Delete <entry>". The focused row must keep a solid outline under forced
-colors. Up/Down, Home and End move between rows without wrapping; Right
+"Delete <entry>". The workspace has enough files for the tree to scroll: the
+scrolling container must not be a Tab stop of its own (Firefox made it one),
+and with focus on the container itself an arrow key must move to the tab-stop
+row and Home/End to the ends; Enter there must enter the tree too, never
+answer a visible tool approval card (with nothing focused, Enter still does).
+A mouse click on blank tree space focuses the container, and an arrow key then
+enters the tree. An auto-repeated Enter or Space on a row must not open or
+toggle it. The focused row must keep a solid outline under
+forced colors. Up/Down, Home and End move between rows without wrapping; Right
 expands a folder and then enters it; Left goes to the parent and collapses;
 focus stays on the toggled folder across the re-render, and a second Right
 while a slow listing loads must not collapse the folder again. An empty folder

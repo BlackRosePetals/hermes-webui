@@ -12,11 +12,15 @@ WHY THIS EXISTS
 WHAT IT CHECKS (Chromium, plus Firefox when Playwright's build is installed)
   - the container is role=tree with a name; rows are treeitems with
     aria-level; folders carry aria-expanded, files do not; names say
-    "folder x" / "file y" / "symlink z" (with the target as description);
+    "x folder" / "y file, 1.5 kilobytes" (name first, then kind and size) /
+    "z symlink" (with the target as description);
     arrows and icons are aria-hidden;
   - the tree is one Tab stop: Tab reaches a row, the next Tab leaves the tree,
     and the delete buttons are out of the Tab order with a name that says what
-    they delete; the focused row keeps an outline under forced colors;
+    they delete; the focused row keeps an outline under forced colors; the
+    scrolling container is not a Tab stop of its own (Firefox made it one, so
+    Shift+Tab landed on an empty "tree"), and a navigation key on the
+    focused container enters the tree;
   - Up/Down/Home/End move between rows without wrapping; Right expands a folder
     and then enters it; Left goes to the parent and collapses; focus stays on
     the toggled folder across the re-render; a second Right during a slow
@@ -110,17 +114,26 @@ def _wait_until(page, expression, arg=None, timeout_ms=WAIT_MS):
 
 
 def _make_workspace(root):
-    """Folders sort before files: alpha/, beta/, delta/, epsilon/, gamma.txt,
-    note.md, zeta.txt. delta/ holds link.txt, an internal symlink to gamma.txt
-    (the app lists symlinks first, so it lives in its own folder); epsilon/
-    holds a.txt, b.txt and c.txt."""
+    """Folders sort before files: alpha/, beta/, delta/, epsilon/, then
+    filler-00.txt ... filler-39.txt (so the tree scrolls), gamma.txt (2048
+    bytes), note.md (1536 bytes), zeta.txt (10 bytes). delta/ holds link.txt,
+    an internal symlink to gamma.txt (the app lists symlinks first, so it lives
+    in its own folder); epsilon/ holds a.txt, b.txt and c.txt; alpha/ holds
+    sub/ and inner.txt."""
     os.makedirs(os.path.join(root, "alpha", "sub"))
     with open(os.path.join(root, "alpha", "inner.txt"), "w") as f:
         f.write("inner\n")
     os.makedirs(os.path.join(root, "beta"))
-    for name in ("gamma.txt", "note.md", "zeta.txt"):
+    # Sizes the size column shows as 2.0k, 1.5k and 0.0k.
+    for name, size in (("gamma.txt", 2048), ("note.md", 1536), ("zeta.txt", 10)):
         with open(os.path.join(root, name), "w") as f:
-            f.write(name + "\n")
+            f.write("x" * size)
+    # Enough files that the tree scrolls: Firefox makes a scrollable container
+    # a Tab stop of its own unless it opts out. They sort between epsilon/ and
+    # gamma.txt, so the first and last rows stay the same.
+    for i in range(40):
+        with open(os.path.join(root, f"filler-{i:02d}.txt"), "w") as f:
+            f.write("x\n")
     os.makedirs(os.path.join(root, "epsilon"))
     for name in ("a.txt", "b.txt", "c.txt"):
         with open(os.path.join(root, "epsilon", name), "w") as f:
@@ -214,13 +227,13 @@ def _check(page, name, workspace):
     rows = page.evaluate(ROWS_JS)
     by_path = {r["path"]: r for r in rows}
     want = {
-        "alpha": ("1", "false", "folder alpha"),
-        "beta": ("1", "false", "folder beta"),
-        "gamma.txt": ("1", None, "file gamma.txt"),
-        "delta": ("1", "false", "folder delta"),
-        "epsilon": ("1", "false", "folder epsilon"),
-        "note.md": ("1", None, "file note.md"),
-        "zeta.txt": ("1", None, "file zeta.txt"),
+        "alpha": ("1", "false", "alpha folder"),
+        "beta": ("1", "false", "beta folder"),
+        "gamma.txt": ("1", None, "gamma.txt file, 2 kilobytes"),
+        "delta": ("1", "false", "delta folder"),
+        "epsilon": ("1", "false", "epsilon folder"),
+        "note.md": ("1", None, "note.md file, 1.5 kilobytes"),
+        "zeta.txt": ("1", None, "zeta.txt file, 10 bytes"),
     }
     for path, (level, expanded, label) in want.items():
         r = by_path.get(path)
@@ -239,7 +252,7 @@ def _check(page, name, workspace):
     page.evaluate("() => document.querySelector('#fileTree [data-a11y-tree-path=\"delta\"]').click()")
     if _wait_until(page, "() => !!document.querySelector('#fileTree [data-a11y-tree-path=\"delta/link.txt\"]')"):
         link = {r["path"]: r for r in page.evaluate(ROWS_JS)}.get("delta/link.txt") or {}
-        if (link.get("level"), link.get("label")) != ("2", "symlink link.txt"):
+        if link.get("level") != "2" or not str(link.get("label")).startswith("link.txt symlink"):
             fail(f"internal symlink row: {link}")
         desc = page.evaluate("() => document.querySelector('#fileTree [data-a11y-tree-path=\"delta/link.txt\"]')"
                              ".getAttribute('aria-description')")
@@ -278,8 +291,81 @@ def _check(page, name, workspace):
         page.focus(ROW_SEL.format("alpha"))
         page.keyboard.press("Shift+Tab")
         back = _focused(page)
-        if not back or back.startswith("row:") or "file-del-btn" in back:
+        if not back or back.startswith("row:") or "file-del-btn" in back or "fileTree" in back:
             fail(f"Shift+Tab from the tab stop stayed inside the tree: {back}")
+    if not page.evaluate("() => { const t = document.getElementById('fileTree'); return t.scrollHeight > t.clientHeight; }"):
+        fail("setup: the tree does not scroll, so the scroller Tab-stop check proves nothing")
+    # Focus can sit on the container itself (a click on blank space, a screen
+    # reader moving there). It stays put, and a navigation key enters the
+    # tree: arrows at the tab stop, Home/End at the ends.
+    if page.evaluate("() => document.getElementById('fileTree').getAttribute('tabindex')") != "-1":
+        fail("the scrolling tree container is not opted out of the Tab order")
+    page.focus(ROW_SEL.format("beta"))
+    for key, want in (("ArrowDown", "row:beta"), ("End", "row:zeta.txt"), ("Home", "row:alpha")):
+        page.evaluate("() => document.getElementById('fileTree').focus()")
+        page.wait_for_timeout(50)
+        if _focused(page) != "div#fileTree.file-tree":
+            fail(f"focusing the container moved focus to {_focused(page)}")
+        page.keyboard.press(key)
+        if not _wait_for_focus(page, want, 2000):
+            fail(f"{key} on the focused container went to {_focused(page)}, expected {want}")
+        if key == "ArrowDown":
+            page.focus(ROW_SEL.format("beta"))
+    # Enter on the focused container while a tool approval waits enters the
+    # tree; it must not count as "no control focused" and approve the action.
+    page.focus(ROW_SEL.format("beta"))
+    approvals = page.evaluate("""() => {
+      const card = document.getElementById('approvalCard');
+      if (!card) return null;
+      window.__approvals = [];
+      window.__realRespondApproval = window.respondApproval;
+      window.respondApproval = (choice) => { window.__approvals.push(choice); };
+      card.classList.add('visible');
+      document.getElementById('fileTree').focus();
+      return true;
+    }""")
+    if approvals is None:
+        fail("setup: #approvalCard not found")
+    else:
+        # Positive control: with nothing focused, the same Enter approves.
+        page.evaluate("() => document.activeElement && document.activeElement.blur()")
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(150)
+        if page.evaluate("() => window.__approvals.slice()") != ["once"]:
+            fail("setup: Enter with nothing focused did not reach the mocked approval")
+        page.evaluate("() => { window.__approvals.length = 0; document.getElementById('fileTree').focus(); }")
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(150)
+        got = page.evaluate("""() => {
+          document.getElementById('approvalCard').classList.remove('visible');
+          window.respondApproval = window.__realRespondApproval;
+          return window.__approvals.slice();
+        }""")
+        if got:
+            fail(f"Enter on the focused tree container answered the pending approval: {got}")
+        if _focused(page) != "row:beta":
+            fail(f"Enter on the focused container went to {_focused(page)}, expected the tab-stop row")
+    # A mouse click on blank tree space (the padding) focuses the container,
+    # like a click on any focusable element; the arrows then enter the tree.
+    page.focus(ROW_SEL.format("beta"))
+    page.focus("#msg")
+    # Scrolled to the top, the container's top padding is blank space.
+    box = page.evaluate("() => { const t = document.getElementById('fileTree'); t.scrollTop = 0;"
+                        " const r = t.getBoundingClientRect(); return [r.left, r.top]; }")
+    page.mouse.click(box[0] + 4, box[1] + 3)
+    page.wait_for_timeout(100)
+    if _focused(page) in ("textarea#msg",) or (_focused(page) or "").startswith("row:"):
+        fail(f"a click on blank tree space left focus on {_focused(page)}")
+    page.keyboard.press("ArrowDown")
+    if not _wait_for_focus(page, "row:beta", 2000):
+        fail(f"ArrowDown after a click on blank tree space went to {_focused(page)}, expected row:beta")
+    # ... also after a re-render replaced the rows.
+    page.focus(ROW_SEL.format("beta"))
+    page.focus("#msg")
+    page.evaluate("() => { renderFileTree(); document.getElementById('fileTree').focus(); }")
+    page.keyboard.press("ArrowUp")
+    if not _wait_for_focus(page, "row:beta", 2000):
+        fail(f"after a re-render, ArrowUp on the container went to {_focused(page)}, not the tab-stop row")
 
     # ── Arrow navigation ─────────────────────────────────────────────────────
     page.focus(ROW_SEL.format("alpha"))
@@ -317,7 +403,7 @@ def _check(page, name, workspace):
         fail(f"focus left alpha after the expand re-render: {_focused(page)}")
     else:
         kids = {r["path"]: r for r in page.evaluate(ROWS_JS)}
-        for child, label in (("alpha/sub", "folder sub"), ("alpha/inner.txt", "file inner.txt")):
+        for child, label in (("alpha/sub", "sub folder"), ("alpha/inner.txt", "inner.txt file, 6 bytes")):
             r = kids.get(child)
             if not r or r["level"] != "2" or r["label"] != label:
                 fail(f"child row {child}: {r}")
@@ -442,6 +528,20 @@ def _check(page, name, workspace):
     else:
         fail("could not expand epsilon")
 
+    # ── A held Enter or Space acts once ──────────────────────────────────────
+    # Auto-repeated keydowns (repeat=true) neither open a file nor toggle a
+    # folder again.
+    page.evaluate(COUNT_OPENS_JS)
+    for path, key in (("gamma.txt", "Enter"), ("beta", "Enter"), ("beta", " ")):
+        page.evaluate("""([sel, key]) => { const r = document.querySelector(sel); r.focus();
+          r.dispatchEvent(new KeyboardEvent('keydown', {key, repeat: true, bubbles: true, cancelable: true})); }""",
+                      [ROW_SEL.format(path), key])
+        page.wait_for_timeout(300)
+    if page.evaluate("() => window.__treeOpens.slice()"):
+        fail(f"an auto-repeated Enter opened {page.evaluate('() => window.__treeOpens.slice()')}")
+    if (_row(page, "beta") or {}).get("expanded") != "false":
+        fail("an auto-repeated Enter or Space toggled beta")
+
     # ── Enter on a file opens it once ────────────────────────────────────────
     page.evaluate(COUNT_OPENS_JS)
     page.focus(ROW_SEL.format("gamma.txt"))
@@ -554,6 +654,14 @@ def _check(page, name, workspace):
                               " return [t.getAttribute('role'), t.getAttribute('aria-label')]; }")
         if attrs != [None, None]:
             fail(f"an empty #fileTree kept its tree role/name: {attrs}")
+    page.evaluate("() => loadDir('.')")
+    _wait_until(page, "() => !!document.querySelector('#fileTree [role=treeitem]')")
+    # The same when focus was on the container itself, not on a row.
+    page.evaluate("() => document.getElementById('fileTree').focus()")
+    page.evaluate("() => loadDir('beta')")
+    if _wait_until(page, "() => !document.querySelector('#fileTree [role=treeitem]')"):
+        if not _wait_for_focus(page, "button#workspaceFilesTab.workspace-panel-tab", 2000):
+            fail(f"focus on the container after the tree emptied: {_focused(page)}, expected the Files tab")
     page.evaluate("() => loadDir('.')")
     _wait_until(page, "() => !!document.querySelector('#fileTree [role=treeitem]')")
     return failures

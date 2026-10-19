@@ -314,8 +314,8 @@ a temporary default workspace and drives the Files tab from the keyboard in
 Chromium, and in Firefox when Playwright's build is installed. The container
 must be `role="tree"` with a name, every row a `treeitem` with `aria-level`,
 folders with `aria-expanded` and files without it, names reading "x folder",
-"y file, 1.5 kilobytes" (name first, then the kind and the size, spoken in
-the UI language rather than the "1.5k" column text) or "z symlink"
+"y file, 1.5k" (name first, then the kind and the size column's text) or
+"z symlink"
 (a symlink also describes its target), and the arrow
 glyph and icon hidden from screen readers. The tree must be a single Tab stop: Tab reaches one row and the next
 Tab leaves the tree, and the delete buttons are out of the Tab order, named

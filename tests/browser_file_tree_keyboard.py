@@ -12,7 +12,7 @@ WHY THIS EXISTS
 WHAT IT CHECKS (Chromium, plus Firefox when Playwright's build is installed)
   - the container is role=tree with a name; rows are treeitems with
     aria-level; folders carry aria-expanded, files do not; names say
-    "x folder" / "y file, 1.5 kilobytes" (name first, then kind and size) /
+    "x folder" / "y file, 1.5k" (name first, then kind and the size column) /
     "z symlink" (with the target as description);
     arrows and icons are aria-hidden;
   - the tree is one Tab stop: Tab reaches a row, the next Tab leaves the tree,
@@ -229,11 +229,11 @@ def _check(page, name, workspace):
     want = {
         "alpha": ("1", "false", "alpha folder"),
         "beta": ("1", "false", "beta folder"),
-        "gamma.txt": ("1", None, "gamma.txt file, 2 kilobytes"),
+        "gamma.txt": ("1", None, "gamma.txt file, 2.0k"),
         "delta": ("1", "false", "delta folder"),
         "epsilon": ("1", "false", "epsilon folder"),
-        "note.md": ("1", None, "note.md file, 1.5 kilobytes"),
-        "zeta.txt": ("1", None, "zeta.txt file, 10 bytes"),
+        "note.md": ("1", None, "note.md file, 1.5k"),
+        "zeta.txt": ("1", None, "zeta.txt file, 0.0k"),
     }
     for path, (level, expanded, label) in want.items():
         r = by_path.get(path)
@@ -403,7 +403,7 @@ def _check(page, name, workspace):
         fail(f"focus left alpha after the expand re-render: {_focused(page)}")
     else:
         kids = {r["path"]: r for r in page.evaluate(ROWS_JS)}
-        for child, label in (("alpha/sub", "sub folder"), ("alpha/inner.txt", "inner.txt file, 6 bytes")):
+        for child, label in (("alpha/sub", "sub folder"), ("alpha/inner.txt", "inner.txt file, 0.0k")):
             r = kids.get(child)
             if not r or r["level"] != "2" or r["label"] != label:
                 fail(f"child row {child}: {r}")

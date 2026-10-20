@@ -16194,7 +16194,25 @@ function clearMessageRenderCache(){
 function _addBoundedHash(add, value, depth){
   if(value==null){ add('null'); return; }
   const t=typeof value;
-  if(t==='string'){ add(value.length); add(value); return; }
+  if(t==='string'){
+    add(value.length);
+    // #8228 re-gate (2026-10-19): a pasted screenshot rides on the user message
+    // as an `image_url` data URI (api/helpers.py:1593 exempts it from redaction),
+    // and the browser receives it even though msgContent() never draws the part.
+    // FNV-hashing every character of that base64 cost ~13x on a vision-heavy
+    // session (35 ms -> 450 ms per render measured in Chromium on 320 messages
+    // with 8 x 1.44 MB images). The transcript cannot render it, so the URL's
+    // exact bytes are not part of the render surface: hash its LENGTH (an image
+    // swap changes it) plus a short prefix/suffix (the mime type and the tail
+    // distinguish one image from another) instead of the whole payload.
+    if(value.length>2048 && value.startsWith('data:')){
+      add('data-uri');
+      add(value.slice(0,64));
+      add(value.slice(-32));
+      return;
+    }
+    add(value); return;
+  }
   if(t==='number'||t==='boolean'){ add(t); add(value); return; }
   if(t==='object'){ _hashObjectInto(add, value, (depth||0)+1); return; }
   add(t); add(String(value));

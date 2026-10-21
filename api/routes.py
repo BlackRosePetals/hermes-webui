@@ -12547,6 +12547,7 @@ from api.streaming import (
     _CompactEchoIndex,
 )
 from api.gateway_chat import _run_gateway_chat_streaming, webui_gateway_chat_enabled
+from api.run_drain import assert_run_admission_open_locked, run_admission_closed_response  # #7293
 from api.run_journal import (
     runtime_model_from_events,
     _parse_run_journal_event_id as _shared_parse_run_journal_event_id,
@@ -20927,7 +20928,10 @@ def handle_post(handler, parsed) -> bool:
             _apply_channel = None
         from api.updates import apply_update
 
-        return j(handler, apply_update(target, _apply_channel))
+        # #7293: an update refuses while WebUI-owned runs are active unless the
+        # client re-sends it with an explicit, user-confirmed force.
+        _force_active_runs = isinstance(body, dict) and body.get("force_active_runs") is True
+        return j(handler, apply_update(target, _apply_channel, force_active_runs=_force_active_runs))
 
     if parsed.path == "/api/updates/force":
         target = body.get("target", "")
@@ -20938,7 +20942,8 @@ def handle_post(handler, parsed) -> bool:
             _force_channel = None
         from api.updates import apply_force_update
 
-        return j(handler, apply_force_update(target, _force_channel))
+        _force_active_runs = isinstance(body, dict) and body.get("force_active_runs") is True  # #7293
+        return j(handler, apply_force_update(target, _force_channel, force_active_runs=_force_active_runs))
 
     if parsed.path == "/api/updates/clear_lock":
         # Manual-instruction recovery for the .git/index.lock case. The
@@ -20953,7 +20958,8 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, 'target must be "webui" or "agent"')
         from api.updates import apply_clear_lock
 
-        return j(handler, apply_clear_lock(target))
+        _force_active_runs = isinstance(body, dict) and body.get("force_active_runs") is True  # #7293
+        return j(handler, apply_clear_lock(target, force_active_runs=_force_active_runs))
 
     if parsed.path == "/api/updates/summary":
         from api.updates import summarize_update_payload
@@ -26165,6 +26171,12 @@ def _handle_btw(handler, body):
         require(body, "question")
     except ValueError as e:
         return bad(handler, str(e))
+    # #7293: refuse before any session mutation while a restart/update or
+    # shutdown drain has closed run admission (503, code server_draining).
+    _admission_refusal = run_admission_closed_response()
+    if _admission_refusal is not None:
+        _admission_status = _admission_refusal.pop("_status", 503)
+        return j(handler, _admission_refusal, status=_admission_status)
     stale_response = _agent_runtime_barrier_response(runner_local_owned=False)
     if stale_response is not None:
         return j(handler, stale_response, status=409)
@@ -26214,6 +26226,9 @@ def _handle_btw(handler, body):
         stream = create_stream_channel()
         register_stream_owner(stream_id, ephemeral.session_id)
         with STREAMS_LOCK:
+            # #7293: refuse inside the registration edge while a restart/update
+            # or shutdown drain has closed run admission.
+            assert_run_admission_open_locked()
             STREAMS[stream_id] = stream
             # Launch-phase ownership claim (re-gate finding B): the reaper's sweep
             # makes this load-bearing on EVERY registration edge, not just the two
@@ -26247,6 +26262,12 @@ def _handle_background(handler, body):
         require(body, "prompt")
     except ValueError as e:
         return bad(handler, str(e))
+    # #7293: refuse before any session mutation while a restart/update or
+    # shutdown drain has closed run admission (503, code server_draining).
+    _admission_refusal = run_admission_closed_response()
+    if _admission_refusal is not None:
+        _admission_status = _admission_refusal.pop("_status", 503)
+        return j(handler, _admission_refusal, status=_admission_status)
     stale_response = _agent_runtime_barrier_response(runner_local_owned=False)
     if stale_response is not None:
         return j(handler, stale_response, status=409)
@@ -26335,6 +26356,7 @@ def _handle_background(handler, body):
         stream = create_stream_channel()
         register_stream_owner(stream_id, bg.session_id)
         with STREAMS_LOCK:
+            assert_run_admission_open_locked()  # #7293 run-admission fence
             STREAMS[stream_id] = stream
             # Same launch-phase claim as every other registration edge (re-gate
             # finding B): its worker is scheduled below, and until it admits itself
@@ -27231,6 +27253,7 @@ def _start_regeneration_stream_locked(
         stream = create_stream_channel()
         register_stream_owner(stream_id, s.session_id)
         with STREAMS_LOCK:
+            assert_run_admission_open_locked()  # #7293 run-admission fence
             STREAMS[stream_id] = stream
             # Launch-phase ownership claim (#7302 finding 5): published atomically
             # with the registration so the orphan check keeps this stream while its
@@ -27758,6 +27781,7 @@ def _start_chat_stream_for_session(
                     stream = create_stream_channel()
                     register_stream_owner(stream_id, s.session_id)
                     with STREAMS_LOCK:
+                        assert_run_admission_open_locked()  # #7293 run-admission fence
                         STREAMS[stream_id] = stream
                         # Same launch-phase claim as the regeneration path
                         # (#7302 finding 5): the ordinary start has the same
@@ -28999,6 +29023,12 @@ def _handle_chat_start(handler, body, diag=None):
                 {"status": "suppressed", "reason": "silent_control_message"},
                 status=200,
             )
+        # #7293: refuse before any session mutation while a restart/update or
+        # shutdown drain has closed run admission (503, code server_draining).
+        _admission_refusal = run_admission_closed_response()
+        if _admission_refusal is not None:
+            _admission_status = _admission_refusal.pop("_status", 503)
+            return j(handler, _admission_refusal, status=_admission_status)
         if body.get("regenerate") is True:
             from api.runtime_adapter import runtime_adapter_runner_enabled
 
@@ -29453,6 +29483,12 @@ def _current_cwd_sync_target(sid):
 
 def _handle_chat_sync(handler, body):
     """Fallback synchronous chat endpoint (POST /api/chat). Not used by frontend."""
+    # #7293: refuse before any session mutation while a restart/update or
+    # shutdown drain has closed run admission (503, code server_draining).
+    _admission_refusal = run_admission_closed_response()
+    if _admission_refusal is not None:
+        _admission_status = _admission_refusal.pop("_status", 503)
+        return j(handler, _admission_refusal, status=_admission_status)
     stale_response = _agent_runtime_barrier_response(runner_local_owned=False)
     if stale_response is not None:
         return j(handler, stale_response, status=409)

@@ -18760,8 +18760,13 @@ def _handle_chat_steer(handler, body: dict) -> bool:
     return j(handler, _deliver_gateway_steer(sid, result, text))
 
 
-def cancel_stream(stream_id: str) -> bool:
+def cancel_stream(stream_id: str, reason: str | None = None) -> bool:
     """Signal an in-flight stream to cancel. Returns True if work was found.
+
+    ``reason`` replaces the default "Task cancelled." detail in the durable
+    cancel marker, the agent interrupt and the terminal cancel event. The
+    restart/shutdown drain (#7293) uses it to settle runs it had to stop as
+    interrupted by the server, not by the user.
 
     Eagerly releases the session lock (pops STREAMS/CANCEL_FLAGS/AGENT_INSTANCES
     and clears session.active_stream_id) so new /api/chat/start requests succeed
@@ -18905,7 +18910,7 @@ def cancel_stream(stream_id: str) -> bool:
             pass
     if agent:
         try:
-            agent.interrupt("Cancelled by user")
+            agent.interrupt(reason or "Cancelled by user")
         except Exception as e:
             # Log but don't block the cancel flow
             import logging
@@ -19278,17 +19283,19 @@ def cancel_stream(stream_id: str) -> bool:
                 # history on the next turn (prevents model from seeing "Task cancelled."
                 # as a prior assistant reply).
                 if not _cancel_marker_exists:
-                    _cs.messages.append({
+                    _cancel_detail = str(reason or '').strip() or 'Task cancelled.'
+                    _cancel_marker = {
                         'role': 'assistant',
                         'content': _cancelled_turn_content(
-                            'Task cancelled.',
+                            _cancel_detail,
                             _preferred_agent_display_name_for_session(_cs),
                         ),
                         '_error': True,
-                        'provider_details': 'Task cancelled.',
+                        'provider_details': _cancel_detail,
                         'provider_details_label': 'Cancellation details',
                         'timestamp': int(time.time()),
-                    })
+                    }
+                    _cs.messages.append(_cancel_marker)
 
                 # A journal-only turn has no in-memory partial to carry into the
                 # cancel save. Persist an exact-stream recovery capability on
@@ -19339,6 +19346,8 @@ def cancel_stream(stream_id: str) -> bool:
                 logger.debug("Failed to note cancel event_id %s for stream %s", _cancel_event_id, stream_id, exc_info=True)
         try:
             _payload = _cancel_event_payload('Cancelled by user', session=_cancel_session_payload)
+            if reason:
+                _payload['message'] = str(reason)
             q.put_nowait(('cancel', _payload))
         except Exception:
             logger.debug("Failed to put cancel event to queue")

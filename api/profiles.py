@@ -892,6 +892,11 @@ def _cron_store_scope_helpers():
     use_cron_store = getattr(_cj, 'use_cron_store', None)
     if not callable(use_cron_store) or not callable(getattr(_cj, 'get_cron_output_dir', None)):
         return None
+    # Lock-free writers rely on the Agent's jobs.json lock to serialize against
+    # each other and against a running job's bookkeeping (Resume holds it across
+    # its read/compute/write). Without it, keep the locked fallback.
+    if not callable(getattr(_cj, '_jobs_lock', None)):
+        return None
     home_mod = _resolve_hermes_home_override()
     if home_mod is None:
         return None

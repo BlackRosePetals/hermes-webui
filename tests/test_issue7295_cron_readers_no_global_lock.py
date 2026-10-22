@@ -463,3 +463,65 @@ def test_concurrent_manual_runs_admit_exactly_one_worker(world, monkeypatch):
     assert [o["status"] for o in outs] == [200, 200], outs
     assert sorted(o["payload"].get("status") for o in outs) == ["already_running", "running"], outs
     assert len(launched) == 1, launched
+
+
+def test_resume_racing_edit_keeps_next_run_on_the_saved_schedule(world, monkeypatch):
+    """Resume reads the schedule and computes next_run_at before writing.
+
+    An Edit landing in that window must not leave the new schedule paired with
+    the old next_run_at (a one-shot moved from Jan to Feb would fire in Jan).
+    Resume is paused right after its computation; the Edit is issued then.
+    """
+    jan, feb = "2099-01-01T00:00:00+00:00", "2099-02-01T00:00:00+00:00"
+    path = world["beta"] / "cron" / "jobs.json"
+    job = _jobs_on_disk(world["beta"])[0]
+    job.update({
+        "schedule": {"kind": "once", "run_at": jan, "display": "once at 2099-01-01 00:00"},
+        "schedule_display": "once at 2099-01-01 00:00",
+        "enabled": False,
+        "state": "paused",
+        "paused_at": "2026-10-01T00:00:00+00:00",
+        "next_run_at": jan,
+        "repeat": {"times": 1, "completed": 0},
+    })
+    path.write_text(json.dumps({"jobs": [job]}), encoding="utf-8")
+
+    live = _cron_jobs()
+    real_compute = live.compute_next_run
+    computed, release = threading.Event(), threading.Event()
+    calls = []
+
+    def compute_then_pause_first_caller(*args, **kwargs):
+        value = real_compute(*args, **kwargs)
+        calls.append(value)
+        if len(calls) == 1:
+            computed.set()
+            release.wait(HOLD_MAX_S)
+        return value
+
+    monkeypatch.setattr(live, "compute_next_run", compute_then_pause_first_caller)
+    resume_t, resume_out = _request("POST", "/api/crons/resume", "beta", body={"job_id": JOB_ID}, deadline=0)
+    assert computed.wait(10), "resume never computed its next run"
+    edit_t, edit_out = _request(
+        "POST", "/api/crons/update", "beta", body={"job_id": JOB_ID, "schedule": feb}, deadline=1.0
+    )
+    release.set()
+    _finish(resume_t, resume_out)
+    _finish(edit_t, edit_out)
+    assert resume_out["status"] == 200 and edit_out["status"] == 200, (resume_out, edit_out)
+
+    from datetime import datetime
+
+    saved = _jobs_on_disk(world["beta"])[0]
+    assert datetime.fromisoformat(saved["schedule"]["run_at"]) == datetime.fromisoformat(feb), saved
+    assert saved["state"] == "scheduled" and saved["enabled"] is True, saved
+    assert datetime.fromisoformat(saved["next_run_at"]) == datetime.fromisoformat(feb), saved
+    _assert_job_untouched(world, "alpha")
+
+
+def test_lock_free_cron_store_scope_requires_the_agent_jobs_lock(world, monkeypatch):
+    """Without the Agent's jobs.json lock nothing would serialize Resume against
+    Edit, so the per-thread scope must fall back to the locked cron context."""
+    assert profiles._cron_store_scope_helpers() is not None or not _HAS_PER_THREAD_HELPERS
+    monkeypatch.setattr(_cron_jobs(), "_jobs_lock", None)
+    assert profiles._cron_store_scope_helpers() is None

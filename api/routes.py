@@ -31,7 +31,7 @@ import http.client
 import socket as _socket
 from collections import defaultdict, deque, OrderedDict
 from pathlib import Path
-from contextlib import closing
+from contextlib import closing, nullcontext
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener
@@ -30182,9 +30182,18 @@ def _handle_cron_resume(handler, body):
     job_id = body.get("job_id", "")
     if not job_id:
         return bad(handler, "job_id required")
+    import cron.jobs as _cron_jobs
     from cron.jobs import resume_job
 
-    result = resume_job(job_id)
+    # resume_job() reads the schedule and computes next_run_at before taking
+    # the Agent's jobs.json lock for its write. Hold that lock across the whole
+    # call so a concurrent Edit cannot land in between and leave the new
+    # schedule paired with the old next_run_at (#7295). cron_store_scope()
+    # only runs lock-free when the Agent has _jobs_lock; otherwise this request
+    # is already inside the legacy locked cron_profile_context().
+    jobs_lock = getattr(_cron_jobs, "_jobs_lock", None)
+    with jobs_lock() if callable(jobs_lock) else nullcontext():
+        result = resume_job(job_id)
     if result:
         return j(handler, {"ok": True, "job": result})
     return bad(handler, "Job not found", 404)

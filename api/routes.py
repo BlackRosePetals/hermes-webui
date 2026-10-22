@@ -1989,6 +1989,28 @@ def _cron_output_dir() -> Path:
     return Path(_cron_jobs.OUTPUT_DIR)
 
 
+def _cron_agent_jobs_lock():
+    """The Agent's jobs.json lock (in-process RLock + per-store ``.jobs.lock``
+    flock), or a no-op context on Agents that predate it.
+
+    #7295: Create persists a job in two writes (``create_job()`` has no
+    ``profile`` parameter, so the selected execution profile and notification
+    flags land in a follow-up ``update_job()``). List and Run no longer wait on
+    Create's cron env lock, so Create holds this lock across both writes and
+    those readers take it around their read: they see no job or the complete
+    one, never ``profile: null`` (which Run would dispatch to the wrong
+    profile). Enter it INSIDE the cron scope (the flock path follows
+    ``use_cron_store``) and never while waiting for ``_cron_env_lock``: a
+    running in-process job holds that lock and takes this one for its own
+    bookkeeping. Older Agents without ``_jobs_lock`` keep these paths on the
+    legacy env lock (see ``cron_store_scope``), which already serializes them.
+    """
+    import cron.jobs as _cron_jobs
+
+    jobs_lock = getattr(_cron_jobs, "_jobs_lock", None)
+    return jobs_lock() if callable(jobs_lock) else nullcontext()
+
+
 _AGENT_CRON_IMPORT_PATH_LOCK = threading.Lock()
 _AGENT_CRON_IMPORT_PATH_READY: str | None = None
 
@@ -2094,7 +2116,7 @@ def _cron_jobs_cross_profile(active_profile: str) -> tuple[list[dict], list[dict
         try:
             # #7295: per-thread store scope, not the global env lock a running
             # in-process cron job holds for its whole run.
-            with cron_store_scope_for_home(home):
+            with cron_store_scope_for_home(home), _cron_agent_jobs_lock():
                 jobs = _cron_jobs_for_api(list_jobs(include_disabled=True))
         except Exception:
             if not is_active:
@@ -30026,15 +30048,8 @@ def _handle_cron_create(handler, body):
         badge_notifications = body.get("badge_notifications") is not False
         requested_model = body.get("model") or None
         requested_provider = body.get("provider") or None
-        job = create_job(
-            prompt=body["prompt"],
-            schedule=body["schedule"],
-            name=body.get("name") or None,
-            deliver=body.get("deliver") or "local",
-            skills=body.get("skills") or [],
-            model=requested_model,
-            provider=requested_provider,
-        )
+        # Computed before the jobs lock: the snapshot repair swaps process env
+        # under its own locks and may be slow; it does not depend on the job.
         post_create_updates = {}
         if profile is not None:
             post_create_updates["profile"] = profile
@@ -30049,8 +30064,23 @@ def _handle_cron_create(handler, body):
             post_create_updates["toast_notifications"] = False
         if not badge_notifications:
             post_create_updates["badge_notifications"] = False
-        if post_create_updates:
-            job = update_job(job["id"], post_create_updates) or job
+        # create_job() cannot take these fields, so the record is written
+        # twice; hold the Agent jobs lock across both writes so lock-free
+        # List/Run never read the intermediate record (#7295). We are already
+        # inside cron_profile_context(), so this never waits on the env lock
+        # while holding the jobs lock.
+        with _cron_agent_jobs_lock():
+            job = create_job(
+                prompt=body["prompt"],
+                schedule=body["schedule"],
+                name=body.get("name") or None,
+                deliver=body.get("deliver") or "local",
+                skills=body.get("skills") or [],
+                model=requested_model,
+                provider=requested_provider,
+            )
+            if post_create_updates:
+                job = update_job(job["id"], post_create_updates) or job
         return j(handler, {"ok": True, "job": _cron_job_for_api(job)})
     except Exception as e:
         return j(handler, {"error": str(e)}, status=400)
@@ -30139,7 +30169,10 @@ def _handle_cron_run(handler, body):
         return bad(handler, "job_id required")
     from cron.jobs import get_job
 
-    job = get_job(job_id)
+    # Under the jobs lock so a concurrent Create's two-step write is never
+    # dispatched half-done (profile not yet persisted) (#7295).
+    with _cron_agent_jobs_lock():
+        job = get_job(job_id)
     if not job:
         return bad(handler, "Job not found", 404)
     # Prevent double-run: claim the job atomically; reject if already running.
@@ -30189,7 +30222,6 @@ def _handle_cron_resume(handler, body):
     job_id = body.get("job_id", "")
     if not job_id:
         return bad(handler, "job_id required")
-    import cron.jobs as _cron_jobs
     from cron.jobs import resume_job
 
     # resume_job() reads the schedule and computes next_run_at before taking
@@ -30198,8 +30230,7 @@ def _handle_cron_resume(handler, body):
     # schedule paired with the old next_run_at (#7295). cron_store_scope()
     # only runs lock-free when the Agent has _jobs_lock; otherwise this request
     # is already inside the legacy locked cron_profile_context().
-    jobs_lock = getattr(_cron_jobs, "_jobs_lock", None)
-    with jobs_lock() if callable(jobs_lock) else nullcontext():
+    with _cron_agent_jobs_lock():
         result = resume_job(job_id)
     if result:
         return j(handler, {"ok": True, "job": result})

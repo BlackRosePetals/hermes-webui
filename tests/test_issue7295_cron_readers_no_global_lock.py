@@ -551,3 +551,131 @@ def test_model_pin_resolves_config_against_the_requesting_profile(world, monkeyp
     assert serialized, "pin-resolving update must wait for the running job's cron env lock"
     assert os.environ.get("HERMES_HOME") == str(world["base"])
     _assert_job_untouched(world, "alpha")
+
+
+def _create_body(**extra):
+    body = {"prompt": "fixture-only", "schedule": "every 1h", "name": "create-race", "profile": "alpha"}
+    body.update(extra)
+    return body
+
+
+@pytest.fixture
+def no_dispatch(monkeypatch):
+    """Record Run dispatches instead of starting workers; keep Create offline."""
+    launched = []
+    monkeypatch.setattr(routes, "_RUNNING_CRON_JOBS", {})
+    monkeypatch.setattr(routes, "_run_cron_tracked", lambda *a, **k: launched.append(a))
+    # Selected-profile provider/model snapshot repair needs a real provider config.
+    monkeypatch.setattr(routes, "_selected_profile_snapshot_updates", lambda *a, **k: {})
+    return launched
+
+
+@requires_per_thread_helpers
+def test_create_two_step_write_is_never_visible_to_list_or_run(world, monkeypatch, no_dispatch):
+    """Codex r2 CORE: Create persists a job in two writes.
+
+    ``create_job()`` has no ``profile`` parameter, so the selected execution
+    profile lands in a follow-up ``update_job()``. List and Run no longer wait
+    on Create's cron env lock; if they read between the two writes they see
+    ``profile: null`` and Run dispatches the job to the requesting profile
+    instead of the selected one. Create is paused right after its first write.
+    """
+    live = _cron_jobs()
+    real_create = live.create_job
+    between, release = threading.Event(), threading.Event()
+    created = {}
+
+    def create_then_pause(*args, **kwargs):
+        job = real_create(*args, **kwargs)
+        created["id"] = job["id"]
+        between.set()
+        release.wait(HOLD_MAX_S)
+        return job
+
+    monkeypatch.setattr(live, "create_job", create_then_pause)
+    create_t, create_out = _request("POST", "/api/crons/create", "beta", body=_create_body(), deadline=0)
+    try:
+        assert between.wait(10), "create never reached its first write"
+        # The intermediate record really is on disk: this is the state readers must not see.
+        partial = [j for j in _jobs_on_disk(world["beta"]) if j["id"] == created["id"]]
+        assert partial and partial[0].get("profile") is None, partial
+        list_t, list_out = _request("GET", "/api/crons", "beta", deadline=0.3)
+        run_t, run_out = _request("POST", "/api/crons/run", "beta", body={"job_id": created["id"]}, deadline=0.3)
+    finally:
+        release.set()
+    _finish(create_t, create_out)
+    _finish(list_t, list_out)
+    _finish(run_t, run_out)
+    assert create_out["status"] == 200 and create_out["payload"]["job"]["profile"] == "alpha", create_out
+    listed = [j for j in list_out["payload"]["jobs"] if j["id"] == created["id"]]
+    assert [j.get("profile") for j in listed] == ["alpha"], listed
+    assert run_out["status"] == 200 and run_out["payload"].get("status") == "running", run_out
+    assert len(no_dispatch) == 1, no_dispatch
+    dispatched, owner_home, execution_home, _event_profile = no_dispatch[0]
+    assert dispatched.get("profile") == "alpha", dispatched
+    assert Path(owner_home) == world["beta"], owner_home
+    assert Path(execution_home) == world["alpha"], execution_home
+    _assert_job_untouched(world, "alpha")
+
+
+@requires_per_thread_helpers
+def test_create_waiting_on_a_running_job_never_holds_the_jobs_lock(world, monkeypatch, no_dispatch):
+    """Lock order is cron env lock -> Agent jobs lock, never the reverse.
+
+    A running in-process job holds the cron env lock and takes the Agent jobs
+    lock for its own bookkeeping. A Create queued behind it must not already
+    hold the jobs lock, or list/Run would stall for the whole run and the
+    job's bookkeeping would deadlock against the waiting Create.
+    """
+    entered, bookkeep, bookkept, release = (threading.Event() for _ in range(4))
+    errors = []
+
+    def running_job():
+        try:
+            with profiles.cron_profile_context_for_home(world["alpha"]):
+                entered.set()
+                bookkeep.wait(HOLD_MAX_S)
+                with _cron_jobs()._jobs_lock():  # e.g. mark_job_run() at the end of the run
+                    bookkept.set()
+                release.wait(HOLD_MAX_S)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    holder = threading.Thread(target=running_job, daemon=True)
+    holder.start()
+    assert entered.wait(10) and profiles._cron_env_lock.locked()
+    try:
+        create_t, create_out = _request("POST", "/api/crons/create", "beta", body=_create_body(), deadline=0.5)
+        create_waited = create_t.is_alive()
+        list_t, list_out = _request("GET", "/api/crons", "beta")
+        run_t, run_out = _request("POST", "/api/crons/run", "beta", body={"job_id": JOB_ID})
+        blocked = [name for name, t in (("list", list_t), ("run", run_t)) if t.is_alive()]
+        bookkeep.set()
+        bookkeeping_ok = bookkept.wait(PROMPT_DEADLINE_S)
+    finally:
+        bookkeep.set()
+        release.set()
+    holder.join(15)
+    assert not holder.is_alive() and errors == [], errors
+    _finish(create_t, create_out)
+    _finish(list_t, list_out)
+    _finish(run_t, run_out)
+    assert create_waited, "create must still wait for the running job's cron env lock"
+    assert blocked == [], f"waited behind a Create parked on the cron env lock: {blocked}"
+    assert bookkeeping_ok, "running job's jobs.json bookkeeping blocked by a waiting Create"
+    assert [j["name"] for j in list_out["payload"]["jobs"]] == ["beta-job"], list_out
+    assert run_out["payload"].get("status") == "running", run_out
+    assert create_out["status"] == 200 and create_out["payload"]["job"]["profile"] == "alpha", create_out
+    assert not profiles._cron_env_lock.locked()
+
+
+def test_agent_jobs_lock_helper_is_a_noop_on_older_agents(monkeypatch):
+    """Without the Agent's _jobs_lock, Create/list/Run stay on the legacy env lock."""
+    live = _cron_jobs()
+    if callable(getattr(live, "_jobs_lock", None)):
+        with routes._cron_agent_jobs_lock():
+            pass
+    monkeypatch.delattr(live, "_jobs_lock", raising=False)
+    with routes._cron_agent_jobs_lock():
+        pass
+    assert profiles._cron_store_scope_helpers() is None

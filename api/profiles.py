@@ -883,6 +883,27 @@ class cron_profile_context:
 # status via get_process_hermes_home) must keep using the lock-based contexts.
 
 
+_RLOCK_TYPES = tuple(
+    t for t in (type(threading.RLock()), getattr(threading, '_PyRLock', None)) if isinstance(t, type)
+)
+
+
+def _agent_jobs_lock_is_reentrant(cron_jobs_mod) -> bool:
+    """True when the thread holding the Agent's ``_jobs_lock()`` may re-enter it.
+
+    The lock-free paths hold ``_jobs_lock()`` around Agent calls that take it
+    again internally (Create's two writes, Resume, List/Run reads). Agents that
+    ship ``use_cron_store`` nest it through a thread-local depth counter over an
+    ``RLock`` (``_jobs_lock_state`` / ``_jobs_file_lock``). Older Agents (e.g.
+    e5b4cf7bea2) use a plain ``threading.Lock``, where that outer hold
+    deadlocks the inner acquire. Anything else is treated as non-reentrant,
+    which keeps the locked fallback (slower, never a hang).
+    """
+    return isinstance(getattr(cron_jobs_mod, '_jobs_file_lock', None), _RLOCK_TYPES) and isinstance(
+        getattr(cron_jobs_mod, '_jobs_lock_state', None), threading.local
+    )
+
+
 def _cron_store_scope_helpers():
     """Return ``(use_cron_store, hermes_constants)`` when the Agent supports it."""
     try:
@@ -894,8 +915,9 @@ def _cron_store_scope_helpers():
         return None
     # Lock-free writers rely on the Agent's jobs.json lock to serialize against
     # each other and against a running job's bookkeeping (Resume holds it across
-    # its read/compute/write). Without it, keep the locked fallback.
-    if not callable(getattr(_cj, '_jobs_lock', None)):
+    # its read/compute/write), and hold it around Agent calls that take it
+    # again, so it must be re-entrant. Otherwise keep the locked fallback.
+    if not callable(getattr(_cj, '_jobs_lock', None)) or not _agent_jobs_lock_is_reentrant(_cj):
         return None
     home_mod = _resolve_hermes_home_override()
     if home_mod is None:

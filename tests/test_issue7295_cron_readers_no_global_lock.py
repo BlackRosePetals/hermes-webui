@@ -17,6 +17,7 @@ fall back to the lock and stay correct.
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import io
 import json
@@ -679,3 +680,102 @@ def test_agent_jobs_lock_helper_is_a_noop_on_older_agents(monkeypatch):
     with routes._cron_agent_jobs_lock():
         pass
     assert profiles._cron_store_scope_helpers() is None
+
+
+OLDER_AGENT_JOB_ID = "01de4a6e1701"
+
+
+def _install_plain_jobs_lock_agent(monkeypatch, *, keep_use_cron_store):
+    """Model an Agent whose ``_jobs_lock`` is a NON-reentrant ``threading.Lock``.
+
+    Agent e5b4cf7bea2 (Codex r3 CORE) has exactly that and no
+    ``use_cron_store``; its ``create_job``/``update_job``/``resume_job`` take
+    the lock internally. ``keep_use_cron_store=True`` models a hypothetical
+    Agent that has the per-thread store helpers but still a plain lock. The
+    real lock blocks forever on re-entry; this one times out and records it so
+    a regression fails fast instead of hanging the suite while holding
+    ``_cron_env_lock``.
+    """
+    live = _cron_jobs()
+    plain = threading.Lock()
+    reentered = []
+
+    @contextlib.contextmanager
+    def plain_jobs_lock():
+        if not plain.acquire(timeout=2.0):
+            reentered.append(threading.current_thread().name)
+            raise RuntimeError("re-entered the non-reentrant Agent jobs lock")
+        try:
+            yield
+        finally:
+            plain.release()
+
+    stored = {}
+
+    def create_job(**kwargs):
+        with plain_jobs_lock():
+            stored.update({"id": OLDER_AGENT_JOB_ID, "name": kwargs.get("name"), "prompt": kwargs.get("prompt"),
+                           "enabled": True, "state": "scheduled"})
+            return dict(stored)
+
+    def update_job(job_id, updates):
+        with plain_jobs_lock():
+            stored.update(updates)
+            return dict(stored)
+
+    def resume_job(job_id):
+        with plain_jobs_lock():
+            return {"id": job_id, "enabled": True, "state": "scheduled"}
+
+    if not keep_use_cron_store:
+        monkeypatch.delattr(live, "use_cron_store", raising=False)
+    monkeypatch.setattr(live, "_jobs_lock", plain_jobs_lock)
+    monkeypatch.setattr(live, "_jobs_file_lock", plain, raising=False)
+    monkeypatch.setattr(live, "create_job", create_job)
+    monkeypatch.setattr(live, "update_job", update_job)
+    monkeypatch.setattr(live, "resume_job", resume_job)
+    return reentered
+
+
+@pytest.mark.parametrize("keep_use_cron_store", [False, True], ids=["agent_e5b4cf7bea2", "store_helpers_plain_lock"])
+def test_non_reentrant_agent_jobs_lock_never_deadlocks_create_or_resume(
+    world, monkeypatch, no_dispatch, keep_use_cron_store
+):
+    """Codex r3 CORE: the outer Agent jobs lock must only be taken when the
+    Agent's lock is re-entrant and the lock-free store scope is in use;
+    otherwise Create/Resume re-acquire it inside the Agent and hang while
+    holding ``_cron_env_lock`` (master returns 200)."""
+    reentered = _install_plain_jobs_lock_agent(monkeypatch, keep_use_cron_store=keep_use_cron_store)
+    create_t, create_out = _request("POST", "/api/crons/create", "beta", body=_create_body(), deadline=10)
+    assert not create_t.is_alive(), "Create hung on the Agent jobs lock"
+    _finish(create_t, create_out)
+    resume_t, resume_out = _request("POST", "/api/crons/resume", "beta", body={"job_id": OLDER_AGENT_JOB_ID}, deadline=10)
+    assert not resume_t.is_alive(), "Resume hung on the Agent jobs lock"
+    _finish(resume_t, resume_out)
+    assert reentered == [], reentered
+    assert create_out["status"] == 200 and create_out["payload"]["job"]["profile"] == "alpha", create_out
+    assert resume_out["status"] == 200 and resume_out["payload"]["job"]["state"] == "scheduled", resume_out
+    assert profiles._cron_store_scope_helpers() is None, "non-reentrant Agent lock must use the locked fallback"
+    with routes._cron_agent_jobs_lock():  # no-op: must not take the plain lock
+        with _cron_jobs()._jobs_lock():
+            pass
+    assert not profiles._cron_env_lock.locked()
+
+
+@requires_per_thread_helpers
+def test_installed_agent_jobs_lock_is_reentrant_when_the_lock_free_scope_is_enabled(world):
+    """Pins the assumption behind the outer jobs lock: on any Agent where the
+    per-thread store scope is enabled, the thread holding ``_jobs_lock()`` can
+    re-enter it (Create/Resume/List/Run call Agent code that takes it again)."""
+    assert profiles._cron_store_scope_helpers() is not None
+    done = threading.Event()
+
+    def nested():
+        with profiles.cron_store_scope_for_home(world["beta"]), routes._cron_agent_jobs_lock():
+            with _cron_jobs()._jobs_lock():
+                done.set()
+
+    t = threading.Thread(target=nested, daemon=True)
+    t.start()
+    t.join(10)
+    assert done.is_set() and not t.is_alive(), "installed Agent _jobs_lock() is not re-entrant"

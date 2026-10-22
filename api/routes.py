@@ -2002,13 +2002,22 @@ def _cron_agent_jobs_lock():
     profile). Enter it INSIDE the cron scope (the flock path follows
     ``use_cron_store``) and never while waiting for ``_cron_env_lock``: a
     running in-process job holds that lock and takes this one for its own
-    bookkeeping. Older Agents without ``_jobs_lock`` keep these paths on the
-    legacy env lock (see ``cron_store_scope``), which already serializes them.
+    bookkeeping.
+
+    Only taken when the lock-free per-thread store scope is in use
+    (``_cron_store_scope_helpers()``, which also requires a re-entrant
+    ``_jobs_lock``): the wrapped Agent calls take this lock again. Every other
+    Agent keeps these paths on the legacy env lock (see ``cron_store_scope``),
+    which already serializes them; there an outer hold of a plain-Lock
+    ``_jobs_lock`` (e.g. Agent e5b4cf7bea2) would deadlock Create and Resume.
     """
+    from api.profiles import _cron_store_scope_helpers
+
+    if _cron_store_scope_helpers() is None:
+        return nullcontext()
     import cron.jobs as _cron_jobs
 
-    jobs_lock = getattr(_cron_jobs, "_jobs_lock", None)
-    return jobs_lock() if callable(jobs_lock) else nullcontext()
+    return _cron_jobs._jobs_lock()
 
 
 _AGENT_CRON_IMPORT_PATH_LOCK = threading.Lock()

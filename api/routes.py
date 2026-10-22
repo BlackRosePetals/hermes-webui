@@ -1889,6 +1889,22 @@ def _mark_cron_done(job_id: str):
         _RUNNING_CRON_JOBS.pop(job_id, None)
 
 
+def _claim_cron_run(job_id: str) -> tuple[bool, float]:
+    """Atomically mark *job_id* running unless it already is.
+
+    Returns ``(claimed, elapsed_seconds_of_existing_run)``. Check and insert
+    happen under one ``_RUNNING_CRON_LOCK`` hold so two concurrent Run requests
+    can never both launch a worker (#7295: Run no longer sits behind the global
+    cron env lock that used to serialize them).
+    """
+    with _RUNNING_CRON_LOCK:
+        started = _RUNNING_CRON_JOBS.get(job_id)
+        if started is not None:
+            return False, time.time() - started
+        _RUNNING_CRON_JOBS[job_id] = time.time()
+        return True, 0.0
+
+
 def _is_cron_running(job_id: str) -> tuple[bool, float]:
     """Return (is_running, elapsed_seconds)."""
     with _RUNNING_CRON_LOCK:
@@ -30119,12 +30135,11 @@ def _handle_cron_run(handler, body):
     job = get_job(job_id)
     if not job:
         return bad(handler, "Job not found", 404)
-    # Prevent double-run: reject if the job is already tracked as running
-    already_running, elapsed = _is_cron_running(job_id)
-    if already_running:
+    # Prevent double-run: claim the job atomically; reject if already running.
+    claimed, elapsed = _claim_cron_run(job_id)
+    if not claimed:
         return j(handler, {"ok": False, "job_id": job_id, "status": "already_running",
                             "elapsed": round(elapsed, 1)})
-    _mark_cron_running(job_id)
     # Capture the TLS-active profile home now — the thread runs after the
     # request finishes, so TLS is gone by then.
     #
@@ -30137,12 +30152,17 @@ def _handle_cron_run(handler, body):
     # run unpinned against the process-global HERMES_HOME — so we'd
     # rather let any unexpected exception 500 the request than corrupt
     # cross-profile state.
-    from api.profiles import get_active_hermes_home
+    try:
+        from api.profiles import get_active_hermes_home
 
-    _profile_home = get_active_hermes_home()
-    _execution_profile_home = _profile_home_for_cron_job(job)
-    _event_profile = _event_profile_for_cron_job(job)
-    threading.Thread(target=_run_cron_tracked, args=(job, _profile_home, _execution_profile_home, _event_profile), daemon=True).start()
+        _profile_home = get_active_hermes_home()
+        _execution_profile_home = _profile_home_for_cron_job(job)
+        _event_profile = _event_profile_for_cron_job(job)
+        threading.Thread(target=_run_cron_tracked, args=(job, _profile_home, _execution_profile_home, _event_profile), daemon=True).start()
+    except BaseException:
+        # No worker owns the claim, so nothing else would ever release it.
+        _mark_cron_done(job_id)
+        raise
     return j(handler, {"ok": True, "job_id": job_id, "status": "running"})
 
 

@@ -431,3 +431,35 @@ def test_older_agent_without_helpers_falls_back_to_lock_and_stays_correct(world,
     assert not profiles._cron_env_lock.locked()
     assert os.environ.get("HERMES_HOME") == str(world["base"])
     assert _cron_jobs().JOBS_FILE == world["base"] / "cron" / "jobs.json"
+
+
+def test_concurrent_manual_runs_admit_exactly_one_worker(world, monkeypatch):
+    """Without the outer env lock, Run admission itself must be atomic.
+
+    Two simultaneous Run requests for one job used to both pass the separate
+    "already running?" check before either marked the job, launching two
+    workers. Any separate mark step is held until both requests reach it, which
+    reproduces that interleaving deterministically.
+    """
+    launched = []
+    monkeypatch.setattr(routes, "_RUNNING_CRON_JOBS", {})
+    monkeypatch.setattr(routes, "_run_cron_tracked", lambda *a, **k: launched.append(a))
+    both_checked = threading.Barrier(2)
+    real_mark = routes._mark_cron_running
+
+    def mark_after_both_checked(job_id):
+        try:
+            both_checked.wait(2.0)
+        except threading.BrokenBarrierError:
+            pass
+        real_mark(job_id)
+
+    monkeypatch.setattr(routes, "_mark_cron_running", mark_after_both_checked)
+    requests = [
+        _request("POST", "/api/crons/run", "beta", body={"job_id": JOB_ID}, deadline=0)
+        for _ in range(2)
+    ]
+    outs = [_finish(t, out) for t, out in requests]
+    assert [o["status"] for o in outs] == [200, 200], outs
+    assert sorted(o["payload"].get("status") for o in outs) == ["already_running", "running"], outs
+    assert len(launched) == 1, launched

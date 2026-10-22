@@ -308,7 +308,7 @@ def _assert_admission_closed(server: DrainServer, phase: str) -> None:
 
 def test_update_refuses_while_run_active_and_force_settles_before_execv(drain_server):
     server = drain_server("3")
-    sid_a, stream_a = server.start_run(60)
+    sid_a, stream_a = server.start_run(600)
     server.wait_active_runs(1)
 
     for path in ("/api/updates/apply", "/api/updates/force"):
@@ -321,7 +321,7 @@ def test_update_refuses_while_run_active_and_force_settles_before_execv(drain_se
 
     # A refusal changes nothing: no restart, the run keeps going, and run
     # admission stays open (a second run can still start).
-    sid_b, stream_b = server.start_run(60)
+    sid_b, stream_b = server.start_run(600)
     server.wait_active_runs(2)
     assert not list(server.record_dir.glob("execv-*.json"))
     # Both runs have streamed output, so the settle has partials to preserve
@@ -367,7 +367,7 @@ def test_update_refuses_while_run_active_and_force_settles_before_execv(drain_se
 def test_sigterm_closes_admission_and_settles_run_at_deadline(drain_server):
     budget = 3.0
     server = drain_server(str(budget))
-    sid, _stream = server.start_run(60)
+    sid, _stream = server.start_run(600)
     server.wait_active_runs(1)
     server.wait_first_output(sid)
 
@@ -411,7 +411,7 @@ def test_sigterm_lets_a_run_finish_inside_the_budget(drain_server):
 
 def test_second_sigterm_escalates_to_immediate_settled_stop(drain_server):
     server = drain_server("40")
-    sid, _stream = server.start_run(120)
+    sid, _stream = server.start_run(600)
     server.wait_active_runs(1)
     server.wait_first_output(sid)
 

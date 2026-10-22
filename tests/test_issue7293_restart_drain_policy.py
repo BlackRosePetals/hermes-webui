@@ -763,6 +763,58 @@ def test_restart_that_does_not_replace_the_process_reopens_admission(monkeypatch
     assert run_drain.run_admission_closed_response() is None
 
 
+def _updates_threading_with(thread_cls):
+    """``api.updates``' view of ``threading`` with only ``Thread`` replaced
+    (patching the real module would hit every thread the process starts)."""
+    import types
+
+    view = types.SimpleNamespace(**{k: getattr(threading, k) for k in dir(threading) if not k.startswith("__")})
+    view.Thread = thread_cls
+    return view
+
+
+def test_restart_thread_that_fails_to_start_reopens_admission(monkeypatch):
+    """Codex r2 #2: admission is closed before the restart thread exists, and
+    only that thread reopened it. A thread that never starts must not leave
+    every later chat start refused with 503 forever."""
+    import api.updates as upd
+
+    class _UnstartableThread:
+        def __init__(self, *a, **k):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(upd, "threading", _updates_threading_with(_UnstartableThread))
+    with pytest.raises(RuntimeError, match="can't start new thread"):
+        upd._schedule_restart(delay=60)
+    assert run_drain.admission_status()["restart_pending"] is False
+    assert run_drain.run_admission_closed_response() is None
+
+
+def test_failed_restart_launch_does_not_reopen_a_newer_pending_restart(monkeypatch):
+    """The cleanup is epoch-scoped like the thread's own: a failed launch must
+    not reopen admission underneath another restart that is still pending."""
+    import api.updates as upd
+
+    newer = {}
+
+    class _UnstartableThread:
+        def __init__(self, *a, **k):
+            pass
+
+        def start(self):
+            newer["epoch"] = run_drain.mark_restart_pending()
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(upd, "threading", _updates_threading_with(_UnstartableThread))
+    with pytest.raises(RuntimeError):
+        upd._schedule_restart(delay=60)
+    assert run_drain.admission_status()["restart_pending"] is True
+    assert run_drain.abandon_restart_pending(newer["epoch"]) is True
+
+
 # ── Route edges: early refusal and the registration-edge race ───────────────
 
 _RACE_SESSION_ID = "drain-race-session"

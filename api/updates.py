@@ -2211,7 +2211,13 @@ def _schedule_restart(delay: float = 2.0) -> None:
                 # Last-resort: let the process supervisor restart us.
                 _windows_restart_exit(0)
 
-    threading.Thread(target=_do, daemon=True).start()
+    try:
+        threading.Thread(target=_do, daemon=True).start()
+    except BaseException:
+        # Only the restart thread reopens admission; one that never started
+        # would leave every chat start refused for the life of the process.
+        run_drain.abandon_restart_pending(restart_epoch)
+        raise
 
 
 def _ensure_gateway_restart_for_agent_update() -> tuple[bool, dict]:

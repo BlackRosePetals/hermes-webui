@@ -17,6 +17,7 @@ from __future__ import annotations
 import pathlib
 import queue
 import threading
+import time
 from unittest.mock import Mock
 
 import pytest
@@ -61,11 +62,13 @@ def _isolated(tmp_path, monkeypatch):
         config.SESSION_AGENT_LOCKS.clear()
 
 
-def _live_turn(sid: str, stream_id: str, *, partial: str = "") -> tuple[queue.Queue, Mock]:
+def _live_turn(
+    sid: str, stream_id: str, *, partial: str = "", started_at: float | None = None
+) -> tuple[queue.Queue, Mock]:
     s = Session(session_id=sid, title="drain", messages=[])
     s.pending_user_message = "write the report"
     s.pending_attachments = []
-    s.pending_started_at = None
+    s.pending_started_at = started_at
     s.active_stream_id = stream_id
     s.save()
     models.SESSIONS[sid] = s
@@ -177,3 +180,22 @@ def test_client_fallback_marker_follows_cancel_initiator():
         "No provider failure occurred.`" in block
     )
     assert "'Task cancelled.'" in block
+
+
+def test_server_settle_of_a_run_with_no_output_yet_keeps_the_turn_recoverable():
+    """A run settled while still launching has streamed nothing: there is no
+    partial to keep, so the marker carries the exact-stream journal recovery
+    capability instead (same as a user Stop at that point). This is the
+    legitimate "no partial" case the real-process tests avoid by waiting for
+    the fake agent's first output before they settle."""
+    _live_turn("s7293_empty", "st7293_empty", partial="", started_at=time.time())
+    streaming.cancel_stream("st7293_empty", reason=SHUTDOWN_SETTLE_REASON, initiator="server")
+
+    msgs = _assistant("s7293_empty")
+    assert not [m for m in msgs if m.get("_partial")]
+    marker = msgs[-1]
+    assert marker.get("cancel_initiator") == "server"
+    assert marker.get("_pending_journal_recovery") is True
+    assert marker.get("_journal_retry_stream_id") == "st7293_empty"
+    s = models.SESSIONS["s7293_empty"]
+    assert any(m.get("role") == "user" and m.get("content") == "write the report" for m in s.messages)

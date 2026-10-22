@@ -30,8 +30,17 @@ import threading
 import time
 
 
+# Set by main(): where SlowFakeAgent announces that a run has streamed output.
+FIRST_OUTPUT_DIR: Path | None = None
+
+
 class SlowFakeAgent:
-    """Streams ``tickN`` deltas until ``sleep:<s>`` elapses or it is interrupted."""
+    """Streams ``tickN`` deltas until ``sleep:<s>`` elapses or it is interrupted.
+
+    After its first delta has been delivered to the WebUI stream callback it
+    writes ``<record_dir>/first-output-<session_id>``, so a test can wait until
+    a run has real partial output before it stops or settles that run.
+    """
 
     def __init__(self, **kwargs):
         self._cb = kwargs.get("stream_delta_callback")
@@ -72,6 +81,11 @@ class SlowFakeAgent:
                     self._cb(chunk)
                 except Exception:
                     pass
+            if n == 1 and FIRST_OUTPUT_DIR is not None and self.session_id:
+                marker = FIRST_OUTPUT_DIR / f"first-output-{self.session_id}"
+                tmp = marker.with_suffix(".tmp")
+                tmp.write_text(chunk, encoding="utf-8")
+                os.replace(tmp, marker)
             self._interrupted.wait(0.1)
         final = "".join(emitted) + "DONE"
         return {"completed": True, "final_response": final,
@@ -84,6 +98,8 @@ def main():
     repo_root, record_dir = (Path(value) for value in sys.argv[1:])
     record_dir.mkdir(parents=True, exist_ok=True)
     sys.path.insert(0, str(repo_root))
+    global FIRST_OUTPUT_DIR
+    FIRST_OUTPUT_DIR = record_dir
 
     import server
     from api import config, run_drain, streaming, updates

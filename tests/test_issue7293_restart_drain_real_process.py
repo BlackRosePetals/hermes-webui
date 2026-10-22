@@ -219,6 +219,21 @@ class DrainServer:
     def session_file(self, sid: str) -> dict:
         return json.loads((self.state_dir / "sessions" / f"{sid}.json").read_text(encoding="utf-8"))
 
+    def wait_first_output(self, sid: str, timeout: float = 15) -> None:
+        """Block until the fake agent of ``sid`` has streamed its first delta.
+
+        Settling a run preserves exactly the output it had streamed so far. A
+        run stopped while it is still launching (registered stream, agent not
+        yet producing) legitimately has no partial to keep and is marked for
+        journal recovery instead, so tests that assert partial preservation
+        must first wait for real output.
+        """
+        path = self.record_dir / f"first-output-{sid}"
+        deadline = time.monotonic() + timeout
+        while not path.exists():
+            assert time.monotonic() < deadline, f"{sid} never streamed output\n{self.log_tail()}"
+            time.sleep(0.02)
+
     def wait_record(self, name: str, timeout: float = 20) -> dict:
         path = self.record_dir / name
         deadline = time.monotonic() + timeout
@@ -254,12 +269,26 @@ def _settle_markers(session: dict, reason: str) -> list[dict]:
 
 
 def _assert_settled(session: dict, reason: str) -> None:
+    dump = json.dumps(session.get("messages"), indent=1)[:4000]
     markers = _settle_markers(session, reason)
-    assert len(markers) == 1, json.dumps(session.get("messages"), indent=1)[:4000]
+    assert len(markers) == 1, dump
+    marker = markers[0]
+    # Server-initiated: the marker names the server and never the user.
+    assert marker.get("cancel_initiator") == "server", dump
+    assert "cancelled by the user" not in str(marker.get("content", "")).lower(), dump
     # No turn is left looking live or pending after the settle.
     assert not session.get("active_stream_id"), session.get("active_stream_id")
     assert not session.get("pending_user_message"), session.get("pending_user_message")
     assert any(m.get("role") == "user" for m in session["messages"]), session["messages"]
+    # The output streamed before the settle is preserved durably, ahead of the
+    # marker, exactly as a user Stop preserves it (callers wait for output).
+    messages = session["messages"]
+    partials = [
+        i for i, m in enumerate(messages)
+        if m.get("role") == "assistant" and m.get("_partial") and str(m.get("content", "")).startswith("tick0")
+    ]
+    assert len(partials) == 1, dump
+    assert partials[0] < messages.index(marker), dump
 
 
 def _assert_admission_closed(server: DrainServer, phase: str) -> None:
@@ -292,6 +321,11 @@ def test_update_refuses_while_run_active_and_force_settles_before_execv(drain_se
     sid_b, stream_b = server.start_run(60)
     server.wait_active_runs(2)
     assert not list(server.record_dir.glob("execv-*.json"))
+    # Both runs have streamed output, so the settle has partials to preserve
+    # (a run settled before its first delta legitimately has none and is
+    # marked for journal recovery instead; see wait_first_output).
+    server.wait_first_output(sid_a)
+    server.wait_first_output(sid_b)
 
     status, forced = server.request(
         "POST", "/api/updates/apply", {"target": "webui", "force_active_runs": True}
@@ -332,6 +366,7 @@ def test_sigterm_closes_admission_and_settles_run_at_deadline(drain_server):
     server = drain_server(str(budget))
     sid, _stream = server.start_run(60)
     server.wait_active_runs(1)
+    server.wait_first_output(sid)
 
     sent = server.signal(signal.SIGTERM)
     _assert_admission_closed(server, "draining")
@@ -375,6 +410,7 @@ def test_second_sigterm_escalates_to_immediate_settled_stop(drain_server):
     server = drain_server("40")
     sid, _stream = server.start_run(120)
     server.wait_active_runs(1)
+    server.wait_first_output(sid)
 
     first = server.signal(signal.SIGTERM)
     _assert_admission_closed(server, "draining")

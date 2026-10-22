@@ -38,6 +38,72 @@ In foreground mode, ``bootstrap.py`` does its setup work and then calls
 sees the long-lived server as the original child. ``KeepAlive=true`` /
 ``Restart=always`` work correctly.
 
+## Stopping: the bounded run drain
+
+A stop signal does not cut agent runs off mid-turn. The first ``SIGTERM`` (or
+``SIGINT``) the server receives starts **one bounded drain**:
+
+1. Run admission closes. A new chat turn gets HTTP ``503`` with
+   ``"code": "server_draining"`` and ``"retryable": true``, and the message
+   tells the user to send it again once the server is back. Runs that are
+   already going are not touched.
+2. Active WebUI agent runs may finish, for up to
+   ``HERMES_WEBUI_SHUTDOWN_DRAIN_SECONDS`` (default **90** seconds).
+3. Any run still active at the deadline is settled: it is stopped and its
+   session is saved with a durable "interrupted" marker (plus any partial
+   output), so the conversation shows what happened instead of a turn that
+   silently vanished. Settling has its own short bound (a few seconds).
+4. The HTTP server stops and the process exits.
+
+If nothing is running, the server exits right away. A **second** stop signal
+during the drain skips the rest of it: active runs are settled as interrupted
+immediately and the server stops. A repeated signal never starts a second
+drain. Gateway-backed runs (chats that execute inside the Hermes Gateway) are
+not waited on or interrupted: they keep running in the Gateway and are picked
+up again after the restart.
+
+``HERMES_WEBUI_SHUTDOWN_DRAIN_SECONDS`` takes plain decimal seconds (``90``,
+``7.5``). ``0`` disables the wait (active runs are settled immediately),
+negative values count as ``0``, values above ``3600`` are capped at ``3600``,
+and anything else (``1e2``, ``inf``, text) is ignored with a warning in favour
+of the default. The server prints the effective value at startup
+(``Stop drain budget: 90s``). ``./ctl.sh stop`` waits that budget plus 5 seconds
+before it falls back to ``SIGKILL``.
+
+Updates started from the WebUI's update banner follow the same rule from the
+other side: while WebUI agent runs are active the update is refused with the
+run count, and the banner offers an explicit **Force update (interrupts N
+runs)**. A forced update settles those runs as interrupted before the server
+re-executes itself.
+
+### The supervisor's stop timeout must outlast the drain
+
+Every supervisor sends ``SIGKILL`` when the process has not exited within its
+stop timeout. ``SIGKILL`` ends the drain with nothing settled, which is exactly
+the lost-turn failure the drain exists to prevent. Set the stop timeout to
+**at least the drain budget + 30 seconds**: **120 seconds** for the default
+90-second budget.
+
+| Supervisor | Setting | Default | For the default 90 s budget |
+|---|---|---|---|
+| systemd | ``TimeoutStopSec=`` | 90 s (``DefaultTimeoutStopSec``) | ``TimeoutStopSec=120`` |
+| launchd | ``ExitTimeOut`` | system-defined (typically 20 s) | ``<integer>120</integer>`` |
+| supervisord | ``stopwaitsecs`` | 10 s | ``stopwaitsecs=120`` |
+| Docker / Compose | ``docker stop -t`` / ``stop_grace_period`` | 10 s | ``-t 120`` / ``stop_grace_period: 120s`` |
+
+Note that systemd's stock 90-second timeout equals the default budget, so
+without the override systemd kills the server just as the drain reaches its
+deadline, before the remaining runs are settled. If you change
+``HERMES_WEBUI_SHUTDOWN_DRAIN_SECONDS``, change the stop timeout with it.
+
+**systemd ``KillMode``.** With the default ``KillMode=control-group``, systemd
+sends ``SIGTERM`` to every process in the unit at once, so the tool processes an
+agent run started (shell commands, builds, test runs) are terminated at the
+start of the drain and the run cannot finish them. Use ``KillMode=mixed``: the
+stop ``SIGTERM`` goes only to the WebUI server, which drains. Child tool
+processes keep running during the drain and are ``SIGKILL``ed by systemd once
+the server exits or ``TimeoutStopSec`` expires, whichever comes first.
+
 ## launchd (macOS)
 
 ``~/Library/LaunchAgents/com.example.hermes-webui.plist``:
@@ -65,6 +131,10 @@ sees the long-lived server as the original child. ``KeepAlive=true`` /
 
     <key>KeepAlive</key>
     <true/>
+
+    <!-- Stop timeout: drain budget (default 90s) + 30s. See "Stopping". -->
+    <key>ExitTimeOut</key>
+    <integer>120</integer>
 
     <key>StandardOutPath</key>
     <string>/Users/yourname/.hermes/webui/launchd-stdout.log</string>
@@ -116,6 +186,11 @@ WorkingDirectory=%h/hermes-webui
 ExecStart=/bin/bash %h/hermes-webui/start.sh --foreground
 Restart=on-failure
 RestartSec=5
+# Let active agent runs drain on stop: SIGTERM only the server (child tool
+# processes are SIGKILLed when it exits or the timeout expires), and wait the
+# drain budget (HERMES_WEBUI_SHUTDOWN_DRAIN_SECONDS, default 90) + 30s.
+KillMode=mixed
+TimeoutStopSec=120
 
 # Optional: route stdout/stderr to journald instead of files
 StandardOutput=journal
@@ -148,7 +223,8 @@ user=youruser
 autostart=true
 autorestart=true
 stopsignal=TERM
-stopwaitsecs=10
+; drain budget (HERMES_WEBUI_SHUTDOWN_DRAIN_SECONDS, default 90) + 30s
+stopwaitsecs=120
 stdout_logfile=/var/log/hermes-webui.out.log
 stderr_logfile=/var/log/hermes-webui.err.log
 environment=HOME="/home/youruser",PATH="/usr/local/bin:/usr/bin:/bin"

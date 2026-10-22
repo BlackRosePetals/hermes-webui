@@ -106,6 +106,29 @@ def main():
 
     streaming._get_ai_agent = lambda: SlowFakeAgent
 
+    # Without a dynamic-home-capable Hermes Agent installed (hosted CI has
+    # none), streaming serializes whole turns on the legacy skill-module patch
+    # lock, so a second concurrent fake run could never stream. The fake agent
+    # touches no skill modules, so that lock protects nothing here; swap in a
+    # no-op lock so two runs stream concurrently, as they do on a current Agent.
+    from api import profiles as _profiles
+
+    class _NoopLock:
+        def acquire(self, *_a, **_k):
+            return True
+
+        def release(self):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    if hasattr(_profiles, "_SKILL_HOME_MODULE_PATCH_LOCK"):
+        _profiles._SKILL_HOME_MODULE_PATCH_LOCK = _NoopLock()
+
     def fake_update_inner(target, *_args, **_kwargs):
         # Long enough for the test to observe the restart-pending fence.
         updates._schedule_restart(float(os.environ.get("ISSUE7293_TEST_RESTART_DELAY", "1.0")))

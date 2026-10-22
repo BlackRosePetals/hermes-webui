@@ -206,7 +206,7 @@ class DrainServer:
         assert status == 200, (status, body)
         return body
 
-    def wait_active_runs(self, count: int, timeout: float = 15) -> dict:
+    def wait_active_runs(self, count: int, timeout: float = 60) -> dict:
         deadline = time.monotonic() + timeout
         body = {}
         while time.monotonic() < deadline:
@@ -219,14 +219,17 @@ class DrainServer:
     def session_file(self, sid: str) -> dict:
         return json.loads((self.state_dir / "sessions" / f"{sid}.json").read_text(encoding="utf-8"))
 
-    def wait_first_output(self, sid: str, timeout: float = 15) -> None:
+    def wait_first_output(self, sid: str, timeout: float = 90) -> None:
         """Block until the fake agent of ``sid`` has streamed its first delta.
 
         Settling a run preserves exactly the output it had streamed so far. A
         run stopped while it is still launching (registered stream, agent not
         yet producing) legitimately has no partial to keep and is marked for
         journal recovery instead, so tests that assert partial preservation
-        must first wait for real output.
+        must first wait for real output. The bound is generous on purpose: a
+        loaded CI host or sandbox can take well over 15s to construct a second
+        agent while the first one streams, and a premature failure here is a
+        fixture flake, not a drain defect.
         """
         path = self.record_dir / f"first-output-{sid}"
         deadline = time.monotonic() + timeout

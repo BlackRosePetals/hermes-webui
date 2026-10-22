@@ -17,6 +17,7 @@ fall back to the lock and stay correct.
 
 from __future__ import annotations
 
+import importlib
 import io
 import json
 import os
@@ -27,17 +28,27 @@ from urllib.parse import urlparse
 
 import pytest
 
-cron_jobs = pytest.importorskip("cron.jobs")  # needs the installed Agent
+_collected_cron_jobs = pytest.importorskip("cron.jobs")  # needs the installed Agent
 
 import api.profiles as profiles  # noqa: E402
 import api.routes as routes  # noqa: E402
+
+
+def _cron_jobs():
+    """The live ``cron.jobs`` module, resolved at use time like the product does.
+
+    Product code imports ``cron.jobs`` inside each call, so patching or reading
+    the object this file bound at collection time would target a stale module
+    if anything re-imported ``cron`` in between.
+    """
+    return importlib.import_module("cron.jobs")
 
 JOB_ID = "a1b2c3d4e5f6"  # identical id in both profiles: wrong-store reads are visible
 RUN_FILE = "2026-10-01_00-00-00.md"
 PROMPT_DEADLINE_S = 3.0
 HOLD_MAX_S = 60.0
 
-_HAS_PER_THREAD_HELPERS = callable(getattr(cron_jobs, "use_cron_store", None)) and callable(
+_HAS_PER_THREAD_HELPERS = callable(getattr(_collected_cron_jobs, "use_cron_store", None)) and callable(
     getattr(__import__("hermes_constants"), "set_hermes_home_override", None)
 )
 requires_per_thread_helpers = pytest.mark.skipif(
@@ -118,6 +129,7 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setattr(routes, "_latest_cron_session_info_for_jobs", lambda *a, **k: {})
     # The process default points at the server-default profile, as in production.
     monkeypatch.setenv("HERMES_HOME", str(base))
+    cron_jobs = _cron_jobs()
     for name, value in (
         ("HERMES_DIR", base),
         ("CRON_DIR", base / "cron"),
@@ -148,12 +160,12 @@ class _Holder:
 
     def body(self, *args, **kwargs):
         self.observed["env_home"] = os.environ.get("HERMES_HOME")
-        self.observed["jobs_file"] = cron_jobs.JOBS_FILE
+        self.observed["jobs_file"] = _cron_jobs().JOBS_FILE
         self.started.set()
         self.release.wait(HOLD_MAX_S)
         # Globals must still be this job's after concurrent readers ran.
         self.observed["env_home_after"] = os.environ.get("HERMES_HOME")
-        self.observed["jobs_file_after"] = cron_jobs.JOBS_FILE
+        self.observed["jobs_file_after"] = _cron_jobs().JOBS_FILE
         return "done"
 
     def _run(self):
@@ -279,7 +291,7 @@ def test_cron_readers_answer_promptly_with_own_profile_while_job_holds_lock(
             results.append((path, t.is_alive(), t, out, check))
         # Globals still belong to the running job while readers ran.
         assert os.environ.get("HERMES_HOME") == str(world["alpha"])
-        assert cron_jobs.JOBS_FILE == world["alpha"] / "cron" / "jobs.json"
+        assert _cron_jobs().JOBS_FILE == world["alpha"] / "cron" / "jobs.json"
         blocked = [path for path, alive, *_ in results if alive]
     for path, _alive, t, out, check in results:
         _finish(t, out)
@@ -354,7 +366,7 @@ def test_reader_scope_resets_per_thread_overrides_on_reused_threads(world):
     import hermes_constants
     from concurrent.futures import ThreadPoolExecutor
 
-    store_var = getattr(cron_jobs, "_cron_store_override", None)
+    store_var = getattr(_cron_jobs(), "_cron_store_override", None)
 
     def serve(profile, path):
         profiles.set_request_profile(profile)
@@ -391,7 +403,7 @@ def test_reader_scope_resets_per_thread_overrides_on_reused_threads(world):
 
 def _hide_per_thread_helpers(monkeypatch, which):
     if which == "use_cron_store":
-        monkeypatch.delattr(cron_jobs, "use_cron_store", raising=False)
+        monkeypatch.delattr(_cron_jobs(), "use_cron_store", raising=False)
     else:
         import hermes_constants
 
@@ -418,4 +430,4 @@ def test_older_agent_without_helpers_falls_back_to_lock_and_stays_correct(world,
     assert out["payload"]["runs"][0]["usage"]["model"] == "beta-model"
     assert not profiles._cron_env_lock.locked()
     assert os.environ.get("HERMES_HOME") == str(world["base"])
-    assert cron_jobs.JOBS_FILE == world["base"] / "cron" / "jobs.json"
+    assert _cron_jobs().JOBS_FILE == world["base"] / "cron" / "jobs.json"

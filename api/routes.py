@@ -1957,6 +1957,22 @@ def _cron_jobs_for_api(jobs) -> list[dict]:
     return [_cron_job_for_api(job) for job in (jobs or [])]
 
 
+def _cron_output_dir() -> Path:
+    """Cron output root for the current cron scope.
+
+    ``get_cron_output_dir()`` honors ``cron.jobs.use_cron_store()``; the
+    ``OUTPUT_DIR`` module constant is process-global and, while an in-process
+    cron job runs, points at that job's profile (#7295). Older Agents only
+    have the constant, which the lock-based fallback context pins.
+    """
+    import cron.jobs as _cron_jobs
+
+    getter = getattr(_cron_jobs, "get_cron_output_dir", None)
+    if callable(getter):
+        return Path(getter())
+    return Path(_cron_jobs.OUTPUT_DIR)
+
+
 _AGENT_CRON_IMPORT_PATH_LOCK = threading.Lock()
 _AGENT_CRON_IMPORT_PATH_READY: str | None = None
 
@@ -2014,7 +2030,7 @@ def _cron_jobs_cross_profile(active_profile: str) -> tuple[list[dict], list[dict
     """
     from cron.jobs import list_jobs
     from api.profiles import (
-        cron_profile_context_for_home,
+        cron_store_scope_for_home,
         get_hermes_home_for_profile,
         list_profiles_api,
     )
@@ -2060,7 +2076,9 @@ def _cron_jobs_cross_profile(active_profile: str) -> tuple[list[dict], list[dict
         seen_homes.add(home_key)
         is_active = _profiles_match(owner_profile, active_profile)
         try:
-            with cron_profile_context_for_home(home):
+            # #7295: per-thread store scope, not the global env lock a running
+            # in-process cron job holds for its whole run.
+            with cron_store_scope_for_home(home):
                 jobs = _cron_jobs_for_api(list_jobs(include_disabled=True))
         except Exception:
             if not is_active:
@@ -17028,45 +17046,49 @@ def handle_get(handler, parsed) -> bool:
             "other_profile_count": hidden_other_count,
         })
 
+    # #7295/#6753: cron reads use the per-thread store scope (lock-free on
+    # Agents with cron.jobs.use_cron_store) so a long in-process cron job that
+    # holds the global cron env lock cannot freeze the Tasks panel polls.
     if parsed.path == "/api/crons/output":
-        from api.profiles import cron_profile_context
+        from api.profiles import cron_store_scope
 
-        with cron_profile_context():
-            _ensure_agent_cron_import_path()
+        _ensure_agent_cron_import_path()
+        with cron_store_scope():
             return _handle_cron_output(handler, parsed)
 
     if parsed.path == "/api/crons/history":
-        from api.profiles import cron_profile_context
+        from api.profiles import cron_store_scope
 
-        with cron_profile_context():
-            _ensure_agent_cron_import_path()
+        _ensure_agent_cron_import_path()
+        with cron_store_scope():
             return _handle_cron_history(handler, parsed)
 
     if parsed.path == "/api/crons/run":
-        from api.profiles import cron_profile_context
+        from api.profiles import cron_store_scope
 
-        with cron_profile_context():
-            _ensure_agent_cron_import_path()
+        _ensure_agent_cron_import_path()
+        with cron_store_scope():
             return _handle_cron_run_detail(handler, parsed)
 
     if parsed.path == "/api/crons/recent":
-        from api.profiles import cron_profile_context
+        from api.profiles import cron_store_scope
 
-        with cron_profile_context():
-            _ensure_agent_cron_import_path()
+        _ensure_agent_cron_import_path()
+        with cron_store_scope():
             return _handle_cron_recent(handler, parsed)
 
     if parsed.path == "/api/crons/status":
-        from api.profiles import cron_profile_context
+        from api.profiles import cron_store_scope
 
-        with cron_profile_context():
+        _ensure_agent_cron_import_path()
+        with cron_store_scope():
             return _handle_cron_status(handler, parsed)
 
     if parsed.path == "/api/crons/delivery-options":
-        from api.profiles import cron_profile_context
+        from api.profiles import cron_store_scope
 
-        with cron_profile_context():
-            _ensure_agent_cron_import_path()
+        _ensure_agent_cron_import_path()
+        with cron_store_scope():
             return _handle_cron_delivery_options(handler)
 
     # ── Skills API (GET) ──
@@ -19396,8 +19418,12 @@ def handle_post(handler, parsed) -> bool:
         return _handle_terminal_close(handler, body)
 
     # ── Cron API (POST) ──
-    # See GET-side comment above: wrap in cron_profile_context so writes go
-    # to the TLS-active profile's jobs.json instead of the process default.
+    # Writes go to the TLS-active profile's jobs.json instead of the process
+    # default. Store-only writers use the per-thread scope (#7295): the Agent's
+    # own jobs.json lock (in-process RLock + .jobs.lock flock) serializes them
+    # against a running job's bookkeeping. Create keeps the global env lock:
+    # its selected-profile snapshot repair mutates process env, which must not
+    # overlap a running in-process cron job.
     if parsed.path == "/api/crons/create":
         from api.profiles import cron_profile_context
 
@@ -19406,38 +19432,38 @@ def handle_post(handler, parsed) -> bool:
             return _handle_cron_create(handler, body)
 
     if parsed.path == "/api/crons/update":
-        from api.profiles import cron_profile_context
+        from api.profiles import cron_store_scope
 
-        with cron_profile_context():
-            _ensure_agent_cron_import_path()
+        _ensure_agent_cron_import_path()
+        with cron_store_scope():
             return _handle_cron_update(handler, body)
 
     if parsed.path == "/api/crons/delete":
-        from api.profiles import cron_profile_context
+        from api.profiles import cron_store_scope
 
-        with cron_profile_context():
-            _ensure_agent_cron_import_path()
+        _ensure_agent_cron_import_path()
+        with cron_store_scope():
             return _handle_cron_delete(handler, body)
 
     if parsed.path == "/api/crons/run":
-        from api.profiles import cron_profile_context
+        from api.profiles import cron_store_scope
 
-        with cron_profile_context():
-            _ensure_agent_cron_import_path()
+        _ensure_agent_cron_import_path()
+        with cron_store_scope():
             return _handle_cron_run(handler, body)
 
     if parsed.path == "/api/crons/pause":
-        from api.profiles import cron_profile_context
+        from api.profiles import cron_store_scope
 
-        with cron_profile_context():
-            _ensure_agent_cron_import_path()
+        _ensure_agent_cron_import_path()
+        with cron_store_scope():
             return _handle_cron_pause(handler, body)
 
     if parsed.path == "/api/crons/resume":
-        from api.profiles import cron_profile_context
+        from api.profiles import cron_store_scope
 
-        with cron_profile_context():
-            _ensure_agent_cron_import_path()
+        _ensure_agent_cron_import_path()
+        with cron_store_scope():
             return _handle_cron_resume(handler, body)
 
     # ── Git workspace ops (POST) ──
@@ -25476,7 +25502,7 @@ def _handle_cron_history(handler, parsed):
     Returns lightweight file listing so the frontend can render a run history
     without fetching full output for every run.
     """
-    from cron.jobs import OUTPUT_DIR as CRON_OUT
+    CRON_OUT = _cron_output_dir()
     import re as _re
 
     qs = parse_qs(parsed.query)
@@ -25523,7 +25549,7 @@ def _handle_cron_history(handler, parsed):
 
 def _handle_cron_run_detail(handler, parsed):
     """Return full content of a single cron run output file."""
-    from cron.jobs import OUTPUT_DIR as CRON_OUT
+    CRON_OUT = _cron_output_dir()
     import re as _re
 
     qs = parse_qs(parsed.query)
@@ -25632,7 +25658,7 @@ def _cron_output_snippet(text: str, limit: int = 600) -> str:
 
 
 def _handle_cron_output(handler, parsed):
-    from cron.jobs import OUTPUT_DIR as CRON_OUT
+    CRON_OUT = _cron_output_dir()
     import re as _re
 
     qs = parse_qs(parsed.query)

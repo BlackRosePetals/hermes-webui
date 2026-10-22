@@ -119,7 +119,7 @@ from api.helpers import (
 )
 from api.profiles import set_request_profile, clear_request_profile
 from api.routes import handle_delete, handle_get, handle_patch, handle_post, handle_put, apply_cors_preflight_headers, fold_api_path
-from api.run_drain import RunAdmissionClosed
+from api.run_drain import RunAdmissionClosed, ShutdownDrain, send_admission_closed
 from api.startup import auto_install_agent_deps, fix_credential_permissions
 from api.updates import WEBUI_VERSION
 from api.crash_visibility import install_crash_visibility
@@ -396,13 +396,8 @@ class Handler(BaseHTTPRequestHandler):
         except _CLIENT_DISCONNECT_ERRORS:
             # Expected disconnect path; do not convert it into a misleading server 500.
             return
-        except RunAdmissionClosed as exc:
-            # #7293: a run-registration edge refused because a restart/update
-            # or shutdown drain closed admission. Not a server error.
-            try:
-                j(self, exc.payload, status=exc.status)
-            except _CLIENT_DISCONNECT_ERRORS:
-                pass
+        except RunAdmissionClosed as exc:  # #7293: a restart/drain closed run admission
+            send_admission_closed(self, exc)
         except Exception:
             self._safe_webui_print(f'[webui] ERROR {self.command} {self.path}\n' + traceback.format_exc())
             try:
@@ -429,13 +424,8 @@ class Handler(BaseHTTPRequestHandler):
         except _CLIENT_DISCONNECT_ERRORS:
             # Expected disconnect path; do not convert it into a misleading server 500.
             return
-        except RunAdmissionClosed as exc:
-            # #7293: a run-registration edge refused because a restart/update
-            # or shutdown drain closed admission. Not a server error.
-            try:
-                j(self, exc.payload, status=exc.status)
-            except _CLIENT_DISCONNECT_ERRORS:
-                pass
+        except RunAdmissionClosed as exc:  # #7293: a restart/drain closed run admission
+            send_admission_closed(self, exc)
         except Exception:
             self._safe_webui_print(f'[webui] ERROR {self.command} {self.path}\n' + traceback.format_exc())
             try:
@@ -716,24 +706,10 @@ def main() -> None:
     print(f'  Then open:     {scheme}://localhost:{PORT}', flush=True)
     print('', flush=True)
 
-    # Stop signals (#7293). Python's default SIGTERM handler terminates the
-    # process WITHOUT unwinding the try/finally around serve_forever(), so the
-    # memory-commit drain (drain_all_on_shutdown) would never run, and every
-    # in-flight agent run would be dropped mid-turn with no durable terminal
-    # state. Instead the FIRST SIGTERM/SIGINT starts one bounded drain:
-    # run admission closes (new chat starts get 503 server_draining), active
-    # WebUI-owned runs may finish within HERMES_WEBUI_SHUTDOWN_DRAIN_SECONDS
-    # (default 90s), anything still running at the deadline is settled durably
-    # as interrupted, then httpd.shutdown() lets serve_forever() return and the
-    # `finally` below drains cleanly. A SECOND signal escalates to an immediate
-    # settled stop; it never starts another drain. Gateway runs a restart can
-    # reattach keep running in the Gateway and are not waited on.
-    #
-    # httpd.shutdown() blocks until serve_forever() has exited and MUST NOT be
-    # called from the thread running serve_forever() (it would deadlock); the
-    # drain calls it from its own thread.
-    from api.run_drain import ShutdownDrain
-
+    # Stop signals (#7293): the first SIGTERM/SIGINT starts ONE bounded run drain
+    # (see api/run_drain.ShutdownDrain), then httpd.shutdown() lets serve_forever()
+    # return so the `finally` below runs drain_all_on_shutdown(); a second signal
+    # escalates. httpd.shutdown() must not run on the serve_forever() thread.
     shutdown_drain = ShutdownDrain(httpd.shutdown)
 
     try:
@@ -741,11 +717,7 @@ def main() -> None:
         signal.signal(signal.SIGINT, shutdown_drain.handle_signal)  # Ctrl-C / ctl.sh daemons (#7078)
     except (ValueError, OSError):
         logger.debug("Could not install shutdown signal handlers", exc_info=True)
-    print(
-        f'  Stop drain budget: {shutdown_drain.budget_seconds:g}s '
-        '(HERMES_WEBUI_SHUTDOWN_DRAIN_SECONDS)',
-        flush=True,
-    )
+    print(f'  Stop drain budget: {shutdown_drain.budget_seconds:g}s (HERMES_WEBUI_SHUTDOWN_DRAIN_SECONDS)', flush=True)
 
     try:
         httpd.serve_forever()

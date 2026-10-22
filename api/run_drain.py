@@ -78,6 +78,16 @@ class RunAdmissionClosed(Exception):
         self.payload = dict(payload)
 
 
+def send_admission_closed(handler, exc: RunAdmissionClosed) -> None:
+    """Answer a refused run registration with its 503; a client disconnect is fine."""
+    from api.helpers import _CLIENT_DISCONNECT_ERRORS, j
+
+    try:
+        j(handler, exc.payload, status=exc.status)
+    except _CLIENT_DISCONNECT_ERRORS:
+        pass
+
+
 # ── Admission fence state ───────────────────────────────────────────────────
 
 _STATE_LOCK = threading.Lock()

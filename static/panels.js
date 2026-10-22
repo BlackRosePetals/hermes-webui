@@ -6463,8 +6463,6 @@ function renderWorkspacesPanel(workspaces){
 
     panel.appendChild(row);
   }
-  const hint=$('workspacesHint');
-  if(hint) hint.textContent=t('workspace_paths_validated_hint');
   // Re-render detail if we have one cached and we're not in a form
   if (_currentWorkspaceDetail && _workspaceMode !== 'create' && _workspaceMode !== 'edit') {
     const refreshed = workspaces.find(w => w.path === _currentWorkspaceDetail.path);

@@ -140,19 +140,19 @@ class TestWorkspaceReorderFrontend:
         for cls in (".ws-drag-handle", ".ws-row.dragging", ".ws-row.drag-over"):
             assert cls in content, f"Missing CSS: {cls}"
 
-    def test_spaces_hint_is_pinned_footer_not_inside_list(self):
-        """The path-validation hint must wrap as a pinned footer, not clip inside the list."""
+    def test_path_hint_lives_only_in_the_add_space_form(self):
+        """The path-validation hint belongs to the non-edit Add Space form, not the Spaces list."""
         with open("static/index.html", "r", encoding="utf-8") as f:
             html = f.read()
-        assert 'id="workspacesHint"' in html
-        assert 'class="workspaces-hint"' in html
-        assert 'data-i18n="workspace_paths_validated_hint"' in html
+        assert 'data-i18n="workspace_paths_validated_hint"' not in html
         with open("static/style.css", "r", encoding="utf-8") as f:
             css = f.read()
         assert ".workspaces-list{flex:1;overflow-y:auto;padding:8px;min-height:0;}" in css
-        assert ".workspaces-hint{flex-shrink:0;" in css
-        assert "overflow-wrap:anywhere" in css
         with open("static/panels.js", "r", encoding="utf-8") as f:
             js = f.read()
-        assert "$('workspacesHint')" in js
-        assert "hint.style.cssText='font-size:11px;color:var(--muted);padding:8px 0'" not in js
+        start = js.index("function renderWorkspacesPanel(")
+        list_src = js[start:js.index("\nfunction ", start + 1)]
+        assert "workspace_paths_validated_hint" not in list_src
+        start = js.index("function _renderWorkspaceForm(")
+        form_src = js[start:js.index("\nfunction ", start + 1)]
+        assert ": `<div class=\"detail-form-hint\">${esc(t('workspace_paths_validated_hint'))}</div>`" in form_src

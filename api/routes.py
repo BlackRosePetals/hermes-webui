@@ -19448,10 +19448,17 @@ def handle_post(handler, parsed) -> bool:
             return _handle_cron_create(handler, body)
 
     if parsed.path == "/api/crons/update":
-        from api.profiles import cron_store_scope
+        from api.profiles import cron_profile_context, cron_store_scope
 
         _ensure_agent_cron_import_path()
-        with cron_store_scope():
+        # pinned=True without an explicit model makes the Agent resolve the
+        # main model from config.yaml, whose ${VAR} expansion (and provider
+        # resolution) reads the process environment. Keep that update on the
+        # locked context that points the process env at this profile (#7295).
+        resolves_model_pin = (
+            isinstance(body, dict) and bool(body.get("pinned")) and "model" not in body
+        )
+        with cron_profile_context() if resolves_model_pin else cron_store_scope():
             return _handle_cron_update(handler, body)
 
     if parsed.path == "/api/crons/delete":

@@ -525,3 +525,29 @@ def test_lock_free_cron_store_scope_requires_the_agent_jobs_lock(world, monkeypa
     assert profiles._cron_store_scope_helpers() is not None or not _HAS_PER_THREAD_HELPERS
     monkeypatch.setattr(_cron_jobs(), "_jobs_lock", None)
     assert profiles._cron_store_scope_helpers() is None
+
+
+@pytest.mark.parametrize("holder_kind", [None, "scheduled_fire_7295"])
+def test_model_pin_resolves_config_against_the_requesting_profile(world, monkeypatch, holder_kind):
+    """pinned=True without a model reads the profile's config.yaml.
+
+    Config ``${VAR}`` expansion reads the process environment, so the pin
+    update must run with the process env pointed at the requesting profile
+    (the locked cron context), never at the default or a running job's profile.
+    """
+    (world["beta"] / "config.yaml").write_text("model:\n  default: ${HERMES_HOME}/beta-model\n", encoding="utf-8")
+    body = {"job_id": JOB_ID, "pinned": True}
+    if holder_kind is None:
+        t, out = _request("POST", "/api/crons/update", "beta", body=body)
+        serialized = True
+    else:
+        with HOLDERS[holder_kind](world, monkeypatch, world["alpha"]):
+            t, out = _request("POST", "/api/crons/update", "beta", body=body, deadline=0.5)
+            serialized = t.is_alive()
+    _finish(t, out)
+    assert out["status"] == 200, out
+    saved = _jobs_on_disk(world["beta"])[0]
+    assert saved.get("model") == f"{world['beta']}/beta-model", saved
+    assert serialized, "pin-resolving update must wait for the running job's cron env lock"
+    assert os.environ.get("HERMES_HOME") == str(world["base"])
+    _assert_job_untouched(world, "alpha")

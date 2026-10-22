@@ -2020,6 +2020,42 @@ def _cron_agent_jobs_lock():
     return _cron_jobs._jobs_lock()
 
 
+# Update keys that make an Agent exposing ``_compute_provider_model_snapshots``
+# (e.g. released v2026.9.14) recompute the provider/model snapshots inside
+# ``update_job()``: exactly provider/model/base_url/no_agent there. ``pinned``
+# is a conservative extra: on Agents with ``_apply_pin_update`` it rewrites
+# provider/model in the same update.
+_CRON_SNAPSHOT_RECOMPUTE_KEYS = frozenset({"model", "provider", "base_url", "no_agent", "pinned"})
+
+
+def _cron_update_needs_profile_context(body) -> bool:
+    """True when ``/api/crons/update`` must run on the locked cron context.
+
+    Some updates make the Agent resolve the model/provider from the profile's
+    ``config.yaml`` (whose ``${VAR}`` expansion reads the PROCESS env) and from
+    provider env vars. The lock-free store scope only points the store and
+    ``get_hermes_home()`` at the profile, so those must keep the locked
+    context that points the process env at it, or they save the default's or
+    a running job's values into this profile's job (#7295):
+
+    * ``pinned=True`` without an explicit ``model`` (current Agents pin the
+      main model from config);
+    * on Agents exposing ``_compute_provider_model_snapshots``, any update
+      touching an inference field (snapshot recomputation).
+    """
+    if not isinstance(body, dict):
+        return False
+    if bool(body.get("pinned")) and "model" not in body:
+        return True
+    if _CRON_SNAPSHOT_RECOMPUTE_KEYS.isdisjoint(body):
+        return False
+    try:
+        import cron.jobs as _cron_jobs
+    except Exception:
+        return False
+    return callable(getattr(_cron_jobs, "_compute_provider_model_snapshots", None))
+
+
 _AGENT_CRON_IMPORT_PATH_LOCK = threading.Lock()
 _AGENT_CRON_IMPORT_PATH_READY: str | None = None
 
@@ -19482,14 +19518,7 @@ def handle_post(handler, parsed) -> bool:
         from api.profiles import cron_profile_context, cron_store_scope
 
         _ensure_agent_cron_import_path()
-        # pinned=True without an explicit model makes the Agent resolve the
-        # main model from config.yaml, whose ${VAR} expansion (and provider
-        # resolution) reads the process environment. Keep that update on the
-        # locked context that points the process env at this profile (#7295).
-        resolves_model_pin = (
-            isinstance(body, dict) and bool(body.get("pinned")) and "model" not in body
-        )
-        with cron_profile_context() if resolves_model_pin else cron_store_scope():
+        with cron_profile_context() if _cron_update_needs_profile_context(body) else cron_store_scope():
             return _handle_cron_update(handler, body)
 
     if parsed.path == "/api/crons/delete":

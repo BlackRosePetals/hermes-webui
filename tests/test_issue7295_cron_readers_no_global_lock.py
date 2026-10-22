@@ -779,3 +779,106 @@ def test_installed_agent_jobs_lock_is_reentrant_when_the_lock_free_scope_is_enab
     t.start()
     t.join(10)
     assert done.is_set() and not t.is_alive(), "installed Agent _jobs_lock() is not re-entrant"
+
+
+SNAPSHOT_TRIGGER_BODIES = {
+    # Codex r3 SILENT: clearing a model pin recomputes model_snapshot from config.
+    "model_cleared": ({"model": None}, {"model": "pinned-model"}),
+    "provider": ({"provider": "custom"}, {}),
+    "base_url": ({"base_url": "http://127.0.0.1:9/v1"}, {}),
+    "no_agent": ({"no_agent": False}, {}),
+}
+
+
+def _install_snapshot_agent(monkeypatch):
+    """Model released Agent v2026.9.14's update_job snapshot recomputation.
+
+    There, ``update_job`` calls ``_compute_provider_model_snapshots`` whenever an
+    update touches provider/model/base_url/no_agent; for an unpinned model it
+    resolves ``model.default`` from ``get_hermes_home()/config.yaml`` with
+    ``${VAR}`` expansion from the PROCESS environment (and resolves the
+    provider from process env too).
+    """
+    live = _cron_jobs()
+    from hermes_cli.config_effective import load_user_config_effective
+
+    def compute(*, provider, model, base_url, no_agent):
+        if bool(no_agent):
+            return None, None
+        model_snapshot = None
+        if not model:
+            cfg_path = live.get_hermes_home() / "config.yaml"
+            cfg = load_user_config_effective(cfg_path) if cfg_path.exists() else {}
+            model_cfg = cfg.get("model") or {}
+            if isinstance(model_cfg, dict):
+                model_cfg = model_cfg.get("default") or model_cfg.get("model")
+            model_snapshot = model_cfg.strip() or None if isinstance(model_cfg, str) else None
+        return None, model_snapshot
+
+    real_update = live.update_job
+
+    def update_job(job_id, updates):
+        updates = dict(updates)
+        if {"provider", "model", "base_url", "no_agent"}.intersection(updates):
+            merged = {**(live.get_job(job_id) or {}), **updates}
+            updates["provider_snapshot"], updates["model_snapshot"] = compute(
+                provider=merged.get("provider"), model=merged.get("model"),
+                base_url=merged.get("base_url"), no_agent=merged.get("no_agent"))
+        return real_update(job_id, updates)
+
+    monkeypatch.setattr(live, "_compute_provider_model_snapshots", compute, raising=False)
+    monkeypatch.setattr(live, "update_job", update_job)
+
+
+@pytest.mark.parametrize("holder_kind", [None, "scheduled_fire_7295"])
+@pytest.mark.parametrize("trigger", sorted(SNAPSHOT_TRIGGER_BODIES))
+def test_snapshot_agent_inference_edits_resolve_config_against_the_requesting_profile(
+    world, monkeypatch, holder_kind, trigger
+):
+    """Codex r3 SILENT: on Agents exposing ``_compute_provider_model_snapshots``
+    an inference-field edit re-resolves the model from config.yaml, whose
+    ``${HERMES_HOME}`` expansion reads the process env. Lock-free, B's job
+    saved the default's or the running job's (A's) path; it must save B's."""
+    body_extra, job_extra = SNAPSHOT_TRIGGER_BODIES[trigger]
+    (world["beta"] / "config.yaml").write_text("model:\n  default: ${HERMES_HOME}/configured-model\n", encoding="utf-8")
+    path = world["beta"] / "cron" / "jobs.json"
+    job = _jobs_on_disk(world["beta"])[0]
+    job.update(job_extra)
+    path.write_text(json.dumps({"jobs": [job]}), encoding="utf-8")
+    _install_snapshot_agent(monkeypatch)
+    body = {"job_id": JOB_ID, **body_extra}
+    if holder_kind is None:
+        t, out = _request("POST", "/api/crons/update", "beta", body=body)
+        serialized = True
+    else:
+        with HOLDERS[holder_kind](world, monkeypatch, world["alpha"]):
+            t, out = _request("POST", "/api/crons/update", "beta", body=body, deadline=0.5)
+            serialized = t.is_alive()
+    _finish(t, out)
+    assert out["status"] == 200, out
+    saved = _jobs_on_disk(world["beta"])[0]
+    assert saved.get("model_snapshot") == f"{world['beta']}/configured-model", saved
+    assert serialized, "snapshot-recomputing update must wait for the running job's cron env lock"
+    assert os.environ.get("HERMES_HOME") == str(world["base"])
+    _assert_job_untouched(world, "alpha")
+
+
+@pytest.mark.parametrize("snapshot_agent", [False, True], ids=["current_agent", "snapshot_agent"])
+def test_cron_update_profile_context_selector(monkeypatch, snapshot_agent):
+    """Which /api/crons/update bodies need the process env pointed at the profile."""
+    live = _cron_jobs()
+    if snapshot_agent:
+        monkeypatch.setattr(live, "_compute_provider_model_snapshots", lambda **kw: (None, None), raising=False)
+    else:
+        monkeypatch.delattr(live, "_compute_provider_model_snapshots", raising=False)
+    needs = routes._cron_update_needs_profile_context
+    # Current Agents: only a pin that resolves the main model reads config.
+    assert needs({"job_id": JOB_ID, "pinned": True}) is True
+    assert needs({"job_id": JOB_ID, "pinned": True, "model": "m"}) is snapshot_agent
+    assert needs({"job_id": JOB_ID, "name": "x", "schedule": "every 2h", "prompt": "p"}) is False
+    assert needs({"job_id": JOB_ID, "enabled": False, "deliver": "local", "skills": []}) is False
+    for key, value in (("model", None), ("model", "m"), ("provider", None), ("provider", "p"),
+                       ("base_url", None), ("base_url", "http://x"), ("no_agent", False), ("no_agent", True),
+                       ("pinned", False)):
+        assert needs({"job_id": JOB_ID, key: value}) is snapshot_agent, (key, value)
+    assert needs(None) is False and needs([]) is False

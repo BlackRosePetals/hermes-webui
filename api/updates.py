@@ -27,7 +27,10 @@ from urllib.parse import urlparse
 from api.agent_health import get_active_profile_gateway_running_pid
 from api.gateway_restart import restart_active_profile_gateway
 from api.profiles import get_active_profile_name
-from api.config import REPO_ROOT, STREAMS, STREAMS_LOCK
+from api.config import REPO_ROOT
+# Restart safety now reads run state through api.run_drain (#7293); these names
+# stay importable here because existing tests patch ``api.updates.STREAMS``.
+from api.config import STREAMS, STREAMS_LOCK  # noqa: F401
 from api.subprocess_utils import (
     clean_git_env,
     noninteractive_git_env,

@@ -13311,6 +13311,10 @@ function _renderActiveRunsForceOffer(target,res,resend){
   if(!errEl||typeof resend!=='function') return;
   const prior=$('btnForceUpdateActiveRuns');
   if(prior&&prior.parentNode) prior.parentNode.remove();
+  // Never show two red force buttons: while this offer is up it is the one
+  // way forward (on the conflict path its re-send also carries the hard reset).
+  const legacyForceBtn=$('btnForceUpdate');
+  if(legacyForceBtn) legacyForceBtn.style.display='none';
   const rawCount=Number(res&&res.active_runs)||Number(res&&res.active_streams)||1;
   const count=Math.max(1,Math.floor(rawCount));
   const plural=count===1?'':'s';
@@ -13521,7 +13525,7 @@ async function forceUpdate(btn,opts){
     const res=await api('/api/updates/force',{method:'POST',body:JSON.stringify(_forceBody),timeoutMs:120000});
     if(!res.ok){
       if(errEl){errEl.textContent='Force update failed: '+(res.message||'unknown error');errEl.style.display='block';}
-      btn.disabled=false;btn.textContent='Force update';
+      btn.disabled=false;btn.textContent='Force update';btn.style.display='inline-block';
       if(res.restart_blocked&&res.force_available){
         _renderActiveRunsForceOffer(target,res,()=>forceUpdate(btn,{forceActiveRuns:true}));
       }

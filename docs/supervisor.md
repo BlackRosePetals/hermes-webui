@@ -87,14 +87,46 @@ the lost-turn failure the drain exists to prevent. Set the stop timeout to
 | Supervisor | Setting | Default | For the default 90 s budget |
 |---|---|---|---|
 | systemd | ``TimeoutStopSec=`` | 90 s (``DefaultTimeoutStopSec``) | ``TimeoutStopSec=120`` |
-| launchd | ``ExitTimeOut`` | system-defined (typically 20 s) | ``<integer>120</integer>`` |
+| launchd | ``ExitTimeOut`` | system-defined (see ``launchd.plist(5)``) | ``<integer>120</integer>`` |
 | supervisord | ``stopwaitsecs`` | 10 s | ``stopwaitsecs=120`` |
-| Docker / Compose | ``docker stop -t`` / ``stop_grace_period`` | 10 s | ``-t 120`` / ``stop_grace_period: 120s`` |
+| Docker / Compose | ``docker stop -t`` / ``stop_grace_period`` | 10 s | see [Docker](#docker-the-drain-does-not-run-yet) below |
 
 Note that systemd's stock 90-second timeout equals the default budget, so
 without the override systemd kills the server just as the drain reaches its
 deadline, before the remaining runs are settled. If you change
 ``HERMES_WEBUI_SHUTDOWN_DRAIN_SECONDS``, change the stop timeout with it.
+
+### Docker: the drain does not run yet
+
+The bundled image does **not** get the bounded drain on ``docker stop`` /
+``docker compose down`` today, whatever ``stop_grace_period`` you set. The
+stop signal never reaches the WebUI server process:
+
+- The image's ``CMD`` is ``/hermeswebui_init.bash`` and there is no init
+  process (no ``tini`` / ``--init``), so that script is PID 1. When the
+  container starts as root (the default) the script drops privileges with
+  ``exec su ... hermeswebui``, which makes ``su`` PID 1, and the re-run script
+  starts the server as a child with ``python server.py`` (no ``exec``).
+- ``docker stop`` signals PID 1 only. util-linux ``su`` answers ``SIGTERM`` by
+  sending ``SIGTERM`` to its child, which is the init script's shell, not the
+  server. The shell exits without passing it on, ``su`` waits two seconds and
+  exits, and the kernel then ``SIGKILL``s every process left in the container,
+  the server included. Running with ``--init`` / Compose ``init: true`` does
+  not help: ``tini`` forwards the signal only to its direct child, the same
+  ``su`` (or init script), with the same result.
+- When the container is started as a non-root user (``--user``), the script
+  itself stays PID 1. It installs no ``SIGTERM`` handler, so the kernel drops
+  the signal, and ``docker stop`` ends in ``SIGKILL`` after its timeout.
+
+Either way the server is ``SIGKILL``ed: active runs are neither drained nor
+settled (they end the way any unexpected kill ends them, and the existing
+startup recovery handles them), and the in-process memory-commit drain on
+shutdown does not run either. Making the init script hand the stop signal to
+the server (``exec`` the server, or forward ``SIGTERM`` to it) is a planned
+follow-up to #7293; until it lands, raising ``stop_grace_period`` does not
+help. The run admission fence, the refuse-or-force update check and
+the settle before a WebUI-initiated re-exec all run inside the server process,
+so they do not depend on the stop signal.
 
 **systemd ``KillMode``.** With the default ``KillMode=control-group``, systemd
 sends ``SIGTERM`` to every process in the unit at once, so the tool processes an

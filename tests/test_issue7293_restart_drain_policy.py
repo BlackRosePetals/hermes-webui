@@ -12,7 +12,8 @@ Owner-approved policy (Option A):
   the deadline is settled as interrupted durably, then the server stops.
 * A repeated signal escalates to an immediate settled stop; it never starts a
   second drain.
-* Gateway-backed runs are not WebUI-owned and are never waited on or settled.
+* Gateway runs whose resumable run identity is durably saved are not
+  WebUI-owned and are never waited on or settled; any other run counts.
 
 These are the in-process contract tests. The real serving-process tests live in
 ``test_issue7293_restart_drain_real_process.py``.
@@ -27,6 +28,7 @@ import time
 import pytest
 
 from api import config
+from api import gateway_chat
 from api import run_drain
 
 
@@ -36,6 +38,9 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 @pytest.fixture(autouse=True)
 def _clean_registries():
     run_drain._reset_for_tests()
+    with gateway_chat._DURABLE_RUN_STREAMS_LOCK:
+        old_durable = set(gateway_chat._DURABLE_RUN_STREAMS)
+        gateway_chat._DURABLE_RUN_STREAMS.clear()
     with config.STREAMS_LOCK:
         old_streams = dict(config.STREAMS)
         old_claims = dict(config.PRE_ADMISSION_CLAIMS)
@@ -56,9 +61,12 @@ def _clean_registries():
         with config.ACTIVE_RUNS_LOCK:
             config.ACTIVE_RUNS.clear()
             config.ACTIVE_RUNS.update(old_runs)
+        with gateway_chat._DURABLE_RUN_STREAMS_LOCK:
+            gateway_chat._DURABLE_RUN_STREAMS.clear()
+            gateway_chat._DURABLE_RUN_STREAMS.update(old_durable)
 
 
-def _add_run(stream_id, *, backend="legacy", session_id="sess", phase="running"):
+def _add_run(stream_id, *, backend="legacy", session_id="sess", phase="running", durable_gateway=False):
     with config.ACTIVE_RUNS_LOCK:
         config.ACTIVE_RUNS[stream_id] = {
             "stream_id": stream_id,
@@ -67,6 +75,9 @@ def _add_run(stream_id, *, backend="legacy", session_id="sess", phase="running")
             "phase": phase,
             "started_at": time.time(),
         }
+    if durable_gateway:
+        # As _record_gateway_run does once the run identity is saved.
+        gateway_chat._mark_gateway_run_durable(stream_id)
 
 
 def _drop_run(stream_id):
@@ -137,12 +148,87 @@ def test_force_flag_does_not_survive_a_failed_update():
 # ── WebUI-owned liveness (gateway exclusion) ────────────────────────────────
 
 
-def test_webui_owned_runs_exclude_gateway_backed_runs():
+def test_webui_owned_runs_exclude_durably_resumable_gateway_runs():
     _add_run("legacy-1", backend="legacy")
-    _add_run("gw-1", backend="gateway")
+    _add_run("gw-1", backend="gateway", durable_gateway=True)
     _add_run("cancelling-1", backend="legacy", phase="cancelling")
     ids = sorted(r["stream_id"] for r in run_drain.webui_owned_active_runs())
     assert ids == ["cancelling-1", "legacy-1"]
+
+
+def test_gateway_run_without_a_durable_run_identity_is_webui_owned():
+    """Codex r1 #2: ``backend == "gateway"`` alone is not resumability.
+
+    The legacy /v1/chat/completions relay never saves a ``gateway_run`` record
+    (reattach rejects it), and a Runs API launch has none until its first save.
+    A restart would abandon either, so both block updates and are drained.
+    """
+    _add_run("gw-relay", backend="gateway")
+    _add_run("gw-durable", backend="gateway", durable_gateway=True)
+    runs = run_drain.webui_owned_active_runs()
+    assert [r["stream_id"] for r in runs] == ["gw-relay"]
+    assert runs[0]["backend"] == "gateway"
+
+
+def test_gateway_launch_awaiting_durable_handoff_is_webui_owned(monkeypatch):
+    """Codex r1 #2: a Gateway launch (stream registered, lifecycle marked, no
+    ACTIVE_RUNS row and no saved run identity yet) is counted, whatever order
+    its ownership markers were published in."""
+    monkeypatch.setitem(gateway_chat._STREAM_RUN_LIFECYCLE, "gw-launch", {"phase": "pending"})
+    with config.STREAMS_LOCK:
+        config.STREAMS["gw-launch"] = object()
+        config.STREAMS["plain-launch"] = object()
+    ids = sorted(r["stream_id"] for r in run_drain.webui_owned_active_runs())
+    assert ids == ["gw-launch", "plain-launch"]
+
+
+def test_update_blocker_counts_a_legacy_gateway_relay():
+    from api import updates
+
+    _add_run("gw-relay", backend="gateway")
+    snap = updates._restart_blocker_snapshot()
+    assert snap["restart_blocked"] is True and snap["blocking_run_ids"] == ["gw-relay"]
+    gateway_chat._mark_gateway_run_durable("gw-relay")
+    assert updates._restart_blocker_snapshot()["restart_blocked"] is False
+
+
+def test_record_gateway_run_marks_durable_only_after_a_successful_save(tmp_path, monkeypatch):
+    from api import models
+    from api.models import Session
+
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    s = Session(session_id="s7293_gw", title="gw", messages=[])
+    s.active_stream_id = "gw-st"
+    s.save()
+    models.SESSIONS["s7293_gw"] = s
+    try:
+        # Not the current stream: nothing is saved, so nothing is resumable.
+        gateway_chat._record_gateway_run("s7293_gw", "gw-other", None, request={"input": "x"})
+        assert gateway_chat.gateway_run_durably_resumable("gw-other") is False
+
+        # The save fails: the request record is not durable (the launch fails).
+        def failing_save(*_a, **_kw):
+            raise OSError("disk full")
+
+        s.save = failing_save
+        try:
+            with pytest.raises(OSError):
+                gateway_chat._record_gateway_run("s7293_gw", "gw-st", None, request={"input": "x"})
+        finally:
+            del s.save  # drop the instance override; Session.save serializes __dict__
+        assert gateway_chat.gateway_run_durably_resumable("gw-st") is False
+
+        gateway_chat._record_gateway_run("s7293_gw", "gw-st", None, request={"input": "x"})
+        assert gateway_chat.gateway_run_durably_resumable("gw-st") is True
+        assert (Session.load("s7293_gw").gateway_run or {}).get("stream_id") == "gw-st"
+        # Teardown releases it.
+        gateway_chat.release_gateway_stream_state("gw-st")
+        assert gateway_chat.gateway_run_durably_resumable("gw-st") is False
+    finally:
+        models.SESSIONS.pop("s7293_gw", None)
 
 
 def test_launching_streams_count_as_webui_owned_work():
@@ -170,7 +256,7 @@ def test_settle_cancels_only_webui_owned_runs_with_reason(monkeypatch):
     monkeypatch.setattr(streaming, "cancel_stream", fake_cancel)
     _add_run("legacy-a")
     _add_run("legacy-b")
-    _add_run("gw-a", backend="gateway")
+    _add_run("gw-a", backend="gateway", durable_gateway=True)
 
     result = run_drain.settle_webui_owned_runs("server stopping", timeout=2.0)
 
@@ -270,7 +356,7 @@ def test_run_exceeding_budget_is_settled_then_server_stops(monkeypatch):
 
     monkeypatch.setattr(streaming, "cancel_stream", fake_cancel)
     _add_run("legacy-long")
-    _add_run("gw-long", backend="gateway")
+    _add_run("gw-long", backend="gateway", durable_gateway=True)
     stop = _StopRecorder()
     drain = run_drain.ShutdownDrain(stop, budget_seconds=0.4, settle_seconds=1, poll_seconds=0.02)
     t0 = time.monotonic()
@@ -458,7 +544,7 @@ def test_forced_restart_settles_webui_runs_before_execv_and_leaves_gateway_runs(
     monkeypatch.setattr(upd, "_purge_agent_pycache", lambda *_a: None)
     monkeypatch.setattr(os, "execv", lambda exe, args: events.append(("execv", exe)))
     _add_run("legacy-1")
-    _add_run("gw-1", backend="gateway")
+    _add_run("gw-1", backend="gateway", durable_gateway=True)
 
     token = run_drain.hold_run_admission("update:webui", force=True)
     upd._schedule_restart(delay=0.01)

@@ -13,8 +13,10 @@ Policy (owner-approved, "Option A"):
   then the HTTP server stops.
 * A repeated signal escalates to an immediate settled stop. It never starts a
   second drain.
-* Gateway-backed runs are owned by the Hermes Gateway, keep running there and
-  are resumed after a restart, so they are never counted, waited on or settled.
+* A Gateway-backed run whose resumable run identity is durably saved keeps
+  running in the Hermes Gateway and is reattached after a restart, so it is not
+  counted, waited on or settled. Any other run (a legacy Gateway chat relay, or
+  a Gateway launch still awaiting that durable handoff) counts as WebUI-owned.
 
 Lock order: ``STREAMS_LOCK -> _STATE_LOCK``. ``_STATE_LOCK`` is a leaf lock and
 nothing here takes ``STREAMS_LOCK`` or ``ACTIVE_RUNS_LOCK`` while holding it.
@@ -238,7 +240,7 @@ def assert_run_admission_open_locked() -> None:
 
 
 def _gateway_launching_ids() -> set:
-    """Stream ids the Gateway backend is launching (not yet in ACTIVE_RUNS)."""
+    """Stream ids the Gateway backend is launching (labels only, never exclusion)."""
     gw = sys.modules.get("api.gateway_chat")
     if gw is None:
         return set()
@@ -249,12 +251,31 @@ def _gateway_launching_ids() -> set:
         return set()
 
 
+def _gateway_run_durably_resumable(stream_id: str) -> bool:
+    """True once a restart can reattach this Gateway run (its identity is saved)."""
+    gw = sys.modules.get("api.gateway_chat")
+    if gw is None:
+        return False
+    try:
+        return bool(gw.gateway_run_durably_resumable(stream_id))
+    except Exception:
+        return False
+
+
 def webui_owned_active_runs() -> list[dict]:
     """Return the WebUI-owned agent work that is live right now.
 
     Union of ``ACTIVE_RUNS`` (worker lifecycle, including runs still unwinding
     after a cancel) and ``STREAMS`` (registered streams, including ones whose
-    worker is still launching). Gateway-backed runs are excluded.
+    worker is still launching).
+
+    The only exclusion is a Gateway run whose resumable run identity is already
+    durably saved: it keeps running in the Gateway and a restarted WebUI
+    reattaches it. Everything else is counted conservatively: a legacy
+    ``/v1/chat/completions`` relay (never resumable) and a Gateway launch still
+    awaiting that durable handoff would be abandoned by a restart, so they
+    block updates and are drained/settled like any WebUI run. The decision does
+    not depend on the order in which a launch publishes its ownership markers.
     """
     with _config.STREAMS_LOCK:
         stream_ids = [str(k) for k in _config.STREAMS.keys()]
@@ -268,25 +289,24 @@ def webui_owned_active_runs() -> list[dict]:
 
     runs: list[dict] = []
     for sid, row in run_rows.items():
-        if str(row.get("backend") or "") == "gateway":
+        backend = str(row.get("backend") or "") or "legacy"
+        if backend == "gateway" and _gateway_run_durably_resumable(sid):
             continue
         runs.append({
             "stream_id": sid,
             "session_id": row.get("session_id"),
-            "backend": row.get("backend") or "legacy",
+            "backend": backend,
             "phase": row.get("phase") or "running",
             "launching": False,
             "registered_stream": sid in stream_ids,
         })
     for sid in stream_ids:
         if sid in run_rows:
-            continue  # counted above, or a Gateway row skipped above
-        if sid in gateway_launching:
-            continue
+            continue  # counted above, or a resumable Gateway row skipped above
         runs.append({
             "stream_id": sid,
             "session_id": None,
-            "backend": "legacy",
+            "backend": "gateway" if sid in gateway_launching else "legacy",
             "phase": "launching" if sid in claimed else "registered",
             "launching": sid in claimed,
             "registered_stream": True,

@@ -58,9 +58,12 @@ A stop signal does not cut agent runs off mid-turn. The first ``SIGTERM`` (or
 If nothing is running, the server exits right away. A **second** stop signal
 during the drain skips the rest of it: active runs are settled as interrupted
 immediately and the server stops. A repeated signal never starts a second
-drain. Gateway-backed runs (chats that execute inside the Hermes Gateway) are
-not waited on or interrupted: they keep running in the Gateway and are picked
-up again after the restart.
+drain. A Gateway run (a chat that executes inside the Hermes Gateway through
+its Runs API) is not waited on or interrupted once its run identity is saved:
+it keeps running in the Gateway and is picked up again after the restart. A
+Gateway chat on the older ``/v1/chat/completions`` relay cannot be picked up
+again, so it counts as an active WebUI run, like a Gateway run that is still
+starting.
 
 ``HERMES_WEBUI_SHUTDOWN_DRAIN_SECONDS`` takes plain decimal seconds (``90``,
 ``7.5``). ``0`` disables the wait (active runs are settled immediately),

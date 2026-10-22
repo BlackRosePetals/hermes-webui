@@ -13304,7 +13304,8 @@ function _activeRunsUpdateText(key,count,fallback){
 // runs are active (restart_blocked + force_available). Offer one explicit,
 // confirmed override that re-sends the same request with
 // force_active_runs:true; the server then saves those runs as interrupted
-// before it restarts. Gateway-backed runs are not counted and keep running.
+// before it restarts. Gateway runs that a restart can reattach are not counted
+// and keep running in the Gateway.
 function _renderActiveRunsForceOffer(target,res,resend){
   const errEl=$('updateError');
   if(!errEl||typeof resend!=='function') return;

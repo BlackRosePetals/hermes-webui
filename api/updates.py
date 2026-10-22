@@ -177,8 +177,10 @@ def _apply_fetch_failure_message(fetch_out: str, network_message: str) -> str:
 def _restart_blocker_snapshot() -> dict:
     """Return the WebUI-owned chat work that should block a self-restart.
 
-    Gateway-backed runs are excluded (#7293): they run inside the Hermes
-    Gateway, survive a WebUI restart and are re-attached afterwards.
+    A Gateway run is excluded only once its resumable run identity is saved
+    (#7293): it runs inside the Hermes Gateway, survives a WebUI restart and is
+    reattached afterwards. Legacy Gateway relays and Gateway launches still
+    awaiting that handoff are counted (see run_drain.webui_owned_active_runs).
     """
     from api import run_drain
 

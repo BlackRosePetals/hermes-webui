@@ -726,8 +726,8 @@ def main() -> None:
     # (default 90s), anything still running at the deadline is settled durably
     # as interrupted, then httpd.shutdown() lets serve_forever() return and the
     # `finally` below drains cleanly. A SECOND signal escalates to an immediate
-    # settled stop; it never starts another drain. Gateway-backed runs keep
-    # running in the Gateway and are not waited on.
+    # settled stop; it never starts another drain. Gateway runs a restart can
+    # reattach keep running in the Gateway and are not waited on.
     #
     # httpd.shutdown() blocks until serve_forever() has exited and MUST NOT be
     # called from the thread running serve_forever() (it would deadlock); the

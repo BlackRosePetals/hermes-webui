@@ -136,6 +136,73 @@ def test_server_settle_preserves_partial_output_like_a_user_cancel():
     assert any(m.get("_partial") and m.get("content") == "tick0 tick1" for m in on_disk.messages)
 
 
+def test_server_settle_wins_against_a_worker_that_finalizes_once_interrupted():
+    """Codex r1 #1: the settle must not lose partials to the worker's own cancel.
+
+    ``agent.interrupt()`` releases the worker. If the released worker's cancel
+    finalizer ran before ``cancel_stream`` took the session lock, it cleared
+    ``active_stream_id`` and wrote the *user* cancel marker without partials;
+    the settle then saw a stale stream and skipped its own writeback. Here the
+    fake ``interrupt`` releases a worker that finalizes as fast as it can (the
+    worst case), and the settle must still own the durable terminal state.
+    """
+    sid, stream_id = "s7293_race", "st7293_race"
+    q, agent = _live_turn(sid, stream_id, partial="tick0 tick1")
+    config.register_session_writeback_owner(sid, stream_id)
+    worker_done = threading.Event()
+
+    def _released_worker():
+        # What _run_agent_streaming does once the interrupt lets it unwind.
+        with config._get_session_agent_lock(sid):
+            streaming._finalize_cancelled_turn(models.SESSIONS[sid], stream_id=stream_id)
+        worker_done.set()
+
+    def _interrupt(_message):
+        threading.Thread(target=_released_worker, daemon=True).start()
+        # Give the released worker every chance to finalize first.
+        worker_done.wait(2.0)
+
+    agent.interrupt.side_effect = _interrupt
+    try:
+        assert streaming.cancel_stream(stream_id, reason=SHUTDOWN_SETTLE_REASON, initiator="server") is True
+        assert worker_done.wait(5.0), "the released worker never finalized"
+    finally:
+        config.clear_session_writeback_owner_if_owned(sid, stream_id)
+
+    msgs = _assistant(sid)
+    assert [m.get("content") for m in msgs if m.get("_partial")] == ["tick0 tick1"], msgs
+    markers = [m for m in msgs if str(m.get("content") or "").startswith("**Task cancelled:**")]
+    assert len(markers) == 1, msgs
+    assert markers[0].get("cancel_initiator") == "server", msgs
+    assert not any("cancelled by the user" in str(m.get("content") or "").lower() for m in msgs), msgs
+    agent.interrupt.assert_called_once_with(SHUTDOWN_SETTLE_REASON)
+    # The first terminal event the client sees is the server settle.
+    assert _cancel_event(q).get("cancel_initiator") == "server"
+    on_disk = Session.load(sid)
+    assert any(m.get("_partial") and m.get("content") == "tick0 tick1" for m in on_disk.messages)
+    assert any(m.get("cancel_initiator") == "server" for m in on_disk.messages)
+
+
+def test_user_stop_still_interrupts_before_session_cleanup():
+    """The settle serialization is server-only: a user Stop keeps its existing
+    order (interrupt first, then the session cleanup) and latency."""
+    sid, stream_id = "s7293_uorder", "st7293_uorder"
+    _q, agent = _live_turn(sid, stream_id, partial="tick0")
+    seen = {}
+
+    def _interrupt(_message):
+        lock = config._get_session_agent_lock(sid)
+        free = lock.acquire(blocking=False)
+        if free:
+            lock.release()
+        seen["session_lock_free"] = free
+        seen["active_stream_id"] = models.SESSIONS[sid].active_stream_id
+
+    agent.interrupt.side_effect = _interrupt
+    assert streaming.cancel_stream(stream_id) is True
+    assert seen == {"session_lock_free": True, "active_stream_id": stream_id}
+
+
 def test_user_cancel_marker_is_byte_identical():
     q, agent = _live_turn("s7293_usr", "st7293_usr")
     streaming.cancel_stream("st7293_usr")

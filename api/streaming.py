@@ -18787,6 +18787,47 @@ def _handle_chat_steer(handler, body: dict) -> bool:
     return j(handler, _deliver_gateway_steer(sid, result, text))
 
 
+# Bound on how long a server settle waits for the owning session's lock before
+# it falls back to the user-Stop ordering (interrupt first). Settles run in
+# their own threads under a separate overall timeout (api/run_drain.py).
+_SERVER_SETTLE_SESSION_LOCK_TIMEOUT = 5.0
+
+
+def _settle_session_lock_for_stream(stream_id: str):
+    """Acquire the session lock a cancel of ``stream_id`` will write under.
+
+    Resolves the session id the same way ``_cancel_stream_impl`` does (agent,
+    then the ACTIVE_RUNS row, then the stream-owner registry). Returns the
+    acquired lock, or ``None`` when no owning session is known or the lock is
+    not free within the bound.
+    """
+    from api import config as _live_config
+
+    session_id = None
+    agent = AGENT_INSTANCES.get(stream_id) or _live_config.AGENT_INSTANCES.get(stream_id)
+    if agent is not None:
+        session_id = getattr(agent, "session_id", None)
+    if not session_id:
+        try:
+            with _live_config.ACTIVE_RUNS_LOCK:
+                row = (_live_config.ACTIVE_RUNS or {}).get(stream_id) or {}
+            session_id = str(row.get("session_id") or "").strip() or None
+        except Exception:
+            session_id = None
+    if not session_id:
+        session_id = stream_owner_session_id(stream_id)
+    if not session_id:
+        return None
+    lock = _get_session_agent_lock(session_id)
+    if not lock.acquire(timeout=_SERVER_SETTLE_SESSION_LOCK_TIMEOUT):
+        logger.warning(
+            "Server settle of stream %s: session %s lock busy; settling without serialization",
+            stream_id, session_id,
+        )
+        return None
+    return lock
+
+
 def cancel_stream(
     stream_id: str,
     reason: str | None = None,
@@ -18802,6 +18843,53 @@ def cancel_stream(
     stopped it instead of claiming the user cancelled it, and the cancel event
     carries ``cancel_initiator: "server"``. The default user copy is unchanged.
     Both go through this same path, so partial output is preserved the same way.
+
+    A server settle additionally owns the run's terminal state: it holds the
+    owning session's lock from before the cancellation is published until the
+    captured partials, the server marker and the terminal cancel event are
+    saved/queued, and interrupts the agent only after that, outside every lock.
+    Interrupting first would release the worker, whose own cancel finalizer
+    could take the session lock first, clear ``active_stream_id`` and write a
+    user-cancel marker without the partials, so the settle would then skip its
+    writeback as stale. A user Stop keeps its established order (interrupt
+    first, then the session cleanup), so its interrupt latency is unchanged.
+    """
+    if not _cancel_initiator_is_server(initiator):
+        return _cancel_stream_impl(stream_id, reason, initiator=initiator)
+    held_lock = _settle_session_lock_for_stream(stream_id)
+    deferred_interrupts: list = []
+    try:
+        return _cancel_stream_impl(
+            stream_id,
+            reason,
+            initiator=initiator,
+            held_session_lock=held_lock,
+            deferred_interrupts=deferred_interrupts if held_lock is not None else None,
+        )
+    finally:
+        if held_lock is not None:
+            held_lock.release()
+        for _agent in deferred_interrupts:
+            try:
+                _agent.interrupt(reason or "Cancelled by user")
+            except Exception:
+                logger.debug("Failed to interrupt agent for stream %s", stream_id, exc_info=True)
+
+
+def _cancel_stream_impl(
+    stream_id: str,
+    reason: str | None = None,
+    *,
+    initiator: str = CANCEL_INITIATOR_USER,
+    held_session_lock=None,
+    deferred_interrupts: list | None = None,
+) -> bool:
+    """Body of ``cancel_stream``.
+
+    ``held_session_lock``: the session agent lock the caller already holds (server
+    settle); the session cleanup then runs under it instead of re-acquiring.
+    ``deferred_interrupts``: when given, the agent is appended instead of being
+    interrupted here; the caller interrupts it after releasing the lock.
 
     Eagerly releases the session lock (pops STREAMS/CANCEL_FLAGS/AGENT_INSTANCES
     and clears session.active_stream_id) so new /api/chat/start requests succeed
@@ -18943,7 +19031,11 @@ def cancel_stream(
                 agent = cached[0]
         except Exception:
             pass
-    if agent:
+    if agent and deferred_interrupts is not None:
+        # Server settle: interrupt only after the terminal state is durable
+        # and the session lock is released (see cancel_stream).
+        deferred_interrupts.append(agent)
+    elif agent:
         try:
             agent.interrupt(reason or "Cancelled by user")
         except Exception as e:
@@ -19026,7 +19118,11 @@ def cancel_stream(
     # so the cancel-path mutation races neither the checkpoint thread nor
     # concurrent undo/retry calls.
     if _cancel_session_id:
-        with _get_session_agent_lock(_cancel_session_id):
+        _cancel_session_lock = _get_session_agent_lock(_cancel_session_id)
+        if held_session_lock is not None and _cancel_session_lock is held_session_lock:
+            # Server settle: the caller already holds it (see cancel_stream).
+            _cancel_session_lock = contextlib.nullcontext()
+        with _cancel_session_lock:
             try:
                 _cs = get_session(_cancel_session_id)
                 if not isinstance(getattr(_cs, 'messages', None), list):

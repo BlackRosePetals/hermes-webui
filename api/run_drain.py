@@ -24,6 +24,7 @@ nothing here takes ``STREAMS_LOCK`` or ``ACTIVE_RUNS_LOCK`` while holding it.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import os
 import re
@@ -399,10 +400,15 @@ def shutdown_drain_budget_seconds() -> float:
 class ShutdownDrain:
     """One idempotent, bounded drain per process, driven by stop signals.
 
-    ``handle_signal`` is the SIGTERM/SIGINT handler. It does no blocking work:
-    the first call starts the drain thread, every later call escalates.
-    ``stop`` is called exactly once, from the drain thread, after the outcome
-    is recorded (normally ``httpd.shutdown``).
+    ``handle_signal`` is the SIGTERM/SIGINT handler. It does no blocking work
+    and takes no lock a reentrant handler could need: CPython runs a handler
+    between bytecodes of whatever the main thread is doing, including another
+    run of this same handler. The first call takes the one drain ticket
+    (``next()`` on an ``itertools.count`` is a single atomic step) and starts
+    the drain thread; every later call only sets the plain escalation flag,
+    which the drain thread's bounded polling picks up. ``stop`` is called
+    exactly once, from the drain thread, after the outcome is recorded
+    (normally ``httpd.shutdown``).
     """
 
     def __init__(
@@ -423,8 +429,10 @@ class ShutdownDrain:
         self.settle_seconds = max(0.0, float(settle_seconds))
         self.poll_seconds = max(0.01, float(poll_seconds))
         self.reason = reason
-        self._claimed = False
+        self._tickets = itertools.count()
         self._escalated = False
+        # Woken only by escalate() (a normal-thread API). Signal handlers never
+        # touch it: Event.set() takes a non-reentrant lock.
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
         self.signals: list[int] = []
@@ -436,15 +444,19 @@ class ShutdownDrain:
             self.signals.append(int(signum))
         except Exception:
             pass
-        if not self._claimed:
-            self._claimed = True
-            self._thread = threading.Thread(target=self._run, name="webui-shutdown-drain", daemon=True)
-            self._thread.start()
+        if next(self._tickets) == 0:
+            thread = threading.Thread(target=self._run, name="webui-shutdown-drain", daemon=True)
+            self._thread = thread
+            thread.start()
             return
-        self.escalate()
+        # A repeated signal: escalate. A plain attribute store only.
+        self._escalated = True
 
     def escalate(self) -> None:
-        """Skip the rest of the drain: settle what is active and stop now."""
+        """Skip the rest of the drain: settle what is active and stop now.
+
+        For normal threads only; signal handlers set the flag directly.
+        """
         self._escalated = True
         self._wake.set()
 

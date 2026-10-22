@@ -21,7 +21,12 @@ These are the in-process contract tests. The real serving-process tests live in
 
 from __future__ import annotations
 
+import functools
+import json
+import os
 import pathlib
+import subprocess
+import sys
 import threading
 import time
 
@@ -410,6 +415,140 @@ def test_second_signal_escalates_without_starting_a_second_drain(monkeypatch):
     drain.handle_signal(15, None)
     drain.handle_signal(2, None)
     assert drain._thread is first_thread
+
+
+def _join_drain_threads(timeout: float = 5.0) -> None:
+    for t in threading.enumerate():
+        if t.name == "webui-shutdown-drain":
+            t.join(timeout)
+
+
+def _signal_with_reentry_at_line(drain, at_line: int, reentrant_signum: int) -> bool:
+    """Call ``drain.handle_signal`` and re-enter it at its ``at_line``-th line.
+
+    Every traced line (the handler and everything it calls, threading
+    internals included) is a point where CPython can run another pending signal
+    handler. Returns whether the re-entry happened (False once ``at_line`` is
+    past the last line the handler executes).
+    """
+    fired = []
+    count = [0]
+
+    def local(frame, event, arg):
+        if event == "line" and not fired:
+            count[0] += 1
+            if count[0] == at_line:
+                fired.append(True)
+                drain.handle_signal(reentrant_signum, None)
+        return local
+
+    sys.settrace(lambda frame, event, arg: local)
+    try:
+        drain.handle_signal(15, None)
+    finally:
+        sys.settrace(None)
+    return bool(fired)
+
+
+def _reentry_worker(drain, at_line: int, fired: list) -> None:
+    fired[0] = _signal_with_reentry_at_line(drain, at_line, 2)
+
+
+def test_signal_reentering_the_first_handler_never_starts_a_second_drain(monkeypatch):
+    """Codex r1 #3: the first-signal claim must be atomic.
+
+    A signal that lands between "not yet claimed" and "claimed" used to start
+    a second drain (two ``stop`` calls). Re-enter the handler at every line.
+    """
+    monkeypatch.setattr(run_drain, "webui_owned_active_runs", lambda: [])
+    lines = 0
+    for at_line in range(1, 400):
+        stops = []
+        drain = run_drain.ShutdownDrain(functools.partial(stops.append, 1), budget_seconds=30, settle_seconds=1, poll_seconds=0.01)
+        fired = [None]
+        worker = threading.Thread(target=_reentry_worker, args=(drain, at_line, fired), daemon=True)
+        worker.start()
+        worker.join(5)
+        assert not worker.is_alive(), f"stop handler deadlocked at line {at_line}"
+        if not fired[0]:
+            drain.finished.wait(5)
+            break
+        lines += 1
+        assert drain.finished.wait(5), at_line
+        _join_drain_threads()
+        assert len(stops) == 1, f"re-entry at line {at_line} started {len(stops)} drains"
+        assert drain.signals == [15, 2] or drain.signals == [2, 15], drain.signals
+    assert lines >= 3
+
+
+def test_signal_reentering_an_escalating_handler_cannot_deadlock(monkeypatch):
+    """Codex r1 #3: an escalating handler must take no lock a reentrant
+    handler could need. ``Event.set()`` in the handler deadlocked when a third
+    signal re-entered it inside the Event's condition lock."""
+    active = {"on": True}
+    monkeypatch.setattr(
+        run_drain, "webui_owned_active_runs", lambda: [{"stream_id": "legacy-long"}] if active["on"] else []
+    )
+
+    def fake_settle(_reason, timeout=0.0):
+        active["on"] = False
+        return {"settled": ["legacy-long"], "pending": [], "failed": [], "timed_out": False}
+
+    monkeypatch.setattr(run_drain, "settle_webui_owned_runs", fake_settle)
+    lines = 0
+    for at_line in range(1, 400):
+        active["on"] = True
+        stops = []
+        drain = run_drain.ShutdownDrain(functools.partial(stops.append, 1), budget_seconds=30, settle_seconds=1, poll_seconds=0.01)
+        drain.handle_signal(15, None)  # the first signal: drain running
+        fired = [None]
+        worker = threading.Thread(target=_reentry_worker, args=(drain, at_line, fired), daemon=True)
+        worker.start()
+        worker.join(5)
+        assert not worker.is_alive(), f"escalating stop handler deadlocked at line {at_line}"
+        assert drain.finished.wait(5), at_line
+        _join_drain_threads()
+        assert len(stops) == 1, (at_line, len(stops))
+        assert drain.outcome["result"] == "escalated", (at_line, drain.outcome)
+        if not fired[0]:
+            break
+        lines += 1
+    assert lines >= 1
+
+
+def test_real_reentrant_stop_signals_never_double_drain_or_deadlock(tmp_path):
+    """Same two properties with REAL signal delivery: a trace hook sends the
+    process a signal at every line the handler executes, so CPython re-enters
+    the handler at the next bytecode boundary (tests/issue7293_signal_probe.py)."""
+    env = {"PATH": os.pathsep.join([str(pathlib.Path(sys.executable).parent), "/usr/bin", "/bin"])}
+    for key in ("HOME", "HERMES_HOME", "TMPDIR"):
+        directory = tmp_path / key.lower()
+        directory.mkdir()
+        env[key] = str(directory)
+    (tmp_path / "state").mkdir()
+    env.update(
+        HERMES_BASE_HOME=env["HERMES_HOME"],
+        HERMES_WEBUI_STATE_DIR=str(tmp_path / "state"),
+        HERMES_WEBUI_AGENT_DIR=str(tmp_path / "no-agent"),
+        HERMES_DISABLE_LAZY_INSTALLS="1",
+        PYTHONUNBUFFERED="1",
+    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(REPO / "tests" / "issue7293_signal_probe.py"), str(REPO)],
+            env=env, cwd=tmp_path, capture_output=True, text=True, timeout=120,
+        )
+    except subprocess.TimeoutExpired as exc:  # a deadlocked handler hangs the probe
+        pytest.fail(f"stop-signal probe hung (handler deadlock):\n{(exc.stdout or '')[-2000:]}")
+    rows = [json.loads(line) for line in proc.stdout.splitlines() if line.startswith("{")]
+    assert rows and rows[-1] == {"done": True}, (proc.returncode, proc.stdout[-2000:], proc.stderr[-2000:])
+    scenarios = rows[:-1]
+    assert {r["phase"] for r in scenarios} == {"first", "second"}, scenarios
+    for row in scenarios:
+        assert row["finished"] and row["stops"] == 1, row
+        assert row["signals"] >= 2, row
+        if row["phase"] == "second":
+            assert row["result"] == "escalated", row
 
 
 def test_default_drain_budget_is_the_owner_chosen_90_seconds(monkeypatch):

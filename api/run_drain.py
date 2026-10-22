@@ -317,7 +317,10 @@ def settle_webui_owned_runs(reason: str, *, timeout: float = SHUTDOWN_SETTLE_SEC
 
     def _settle_one(stream_id: str, ev: threading.Event) -> None:
         try:
-            cancel(stream_id, reason=reason)
+            # initiator="server": the durable marker says the WebUI server
+            # stopped the run, not the user. Same partial-preserving path as a
+            # user Stop.
+            cancel(stream_id, reason=reason, initiator=_streaming.CANCEL_INITIATOR_SERVER)
         except Exception as exc:  # pragma: no cover - defensive
             errors[stream_id] = repr(exc)
             logger.warning("[shutdown-drain] settling run %s failed", stream_id, exc_info=True)

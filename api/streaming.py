@@ -1960,8 +1960,24 @@ def _preferred_agent_display_name_for_session(session) -> str:
     return _preferred_agent_display_name()
 
 
-def _cancelled_turn_hint(agent_name: str | None = None) -> str:
+CANCEL_INITIATOR_USER = 'user'
+# The WebUI server itself stopped the run (#7293: shutdown drain deadline,
+# escalated stop, or a forced update restart). The copy must not claim the
+# user cancelled it.
+CANCEL_INITIATOR_SERVER = 'server'
+
+
+def _cancel_initiator_is_server(initiator) -> bool:
+    return str(initiator or '').strip().lower() == CANCEL_INITIATOR_SERVER
+
+
+def _cancelled_turn_hint(agent_name: str | None = None, *, initiator: str = CANCEL_INITIATOR_USER) -> str:
     name = str(agent_name or _preferred_agent_display_name()).strip() or 'Hermes'
+    if _cancel_initiator_is_server(initiator):
+        return (
+            f'The WebUI server stopped this run before {name} finished; '
+            'you did not cancel it. No provider failure occurred.'
+        )
     return f'The run was cancelled by the user before {name} finished. No provider failure occurred.'
 
 
@@ -3249,14 +3265,25 @@ def _session_has_cancel_marker(session) -> bool:
     return False
 
 
-def _cancelled_turn_content(message: str = 'Task cancelled.', agent_name: str | None = None) -> str:
-    """Return cancelled-turn copy matching the verbose provider-error layout."""
+def _cancelled_turn_content(
+    message: str = 'Task cancelled.',
+    agent_name: str | None = None,
+    *,
+    initiator: str = CANCEL_INITIATOR_USER,
+) -> str:
+    """Return cancelled-turn copy matching the verbose provider-error layout.
+
+    ``initiator`` picks who the hint says stopped the run. The default (user)
+    copy is unchanged; ``"server"`` is for runs the WebUI server settled on its
+    own (#7293). The ``**Task cancelled:**`` heading stays the same for both so
+    every cancel-marker detector (``_CANCEL_MARKER_PATTERNS``) keeps working.
+    """
     _message = str(message or 'Task cancelled.').strip()
     if not _message.endswith('.'):
         _message += '.'
     return (
         f"**Task cancelled:** {_message}\n\n"
-        f"*{_cancelled_turn_hint(agent_name)}*"
+        f"*{_cancelled_turn_hint(agent_name, initiator=initiator)}*"
     )
 
 
@@ -18760,13 +18787,21 @@ def _handle_chat_steer(handler, body: dict) -> bool:
     return j(handler, _deliver_gateway_steer(sid, result, text))
 
 
-def cancel_stream(stream_id: str, reason: str | None = None) -> bool:
+def cancel_stream(
+    stream_id: str,
+    reason: str | None = None,
+    *,
+    initiator: str = CANCEL_INITIATOR_USER,
+) -> bool:
     """Signal an in-flight stream to cancel. Returns True if work was found.
 
     ``reason`` replaces the default "Task cancelled." detail in the durable
-    cancel marker, the agent interrupt and the terminal cancel event. The
-    restart/shutdown drain (#7293) uses it to settle runs it had to stop as
-    interrupted by the server, not by the user.
+    cancel marker, the agent interrupt and the terminal cancel event.
+    ``initiator="server"`` marks a run the WebUI server stopped on its own
+    (#7293 restart/shutdown drain settle): the marker hint then says the server
+    stopped it instead of claiming the user cancelled it, and the cancel event
+    carries ``cancel_initiator: "server"``. The default user copy is unchanged.
+    Both go through this same path, so partial output is preserved the same way.
 
     Eagerly releases the session lock (pops STREAMS/CANCEL_FLAGS/AGENT_INSTANCES
     and clears session.active_stream_id) so new /api/chat/start requests succeed
@@ -19284,17 +19319,21 @@ def cancel_stream(stream_id: str, reason: str | None = None) -> bool:
                 # as a prior assistant reply).
                 if not _cancel_marker_exists:
                     _cancel_detail = str(reason or '').strip() or 'Task cancelled.'
+                    _cancel_by_server = _cancel_initiator_is_server(initiator)
                     _cancel_marker = {
                         'role': 'assistant',
                         'content': _cancelled_turn_content(
                             _cancel_detail,
                             _preferred_agent_display_name_for_session(_cs),
+                            initiator=CANCEL_INITIATOR_SERVER if _cancel_by_server else CANCEL_INITIATOR_USER,
                         ),
                         '_error': True,
                         'provider_details': _cancel_detail,
                         'provider_details_label': 'Cancellation details',
                         'timestamp': int(time.time()),
                     }
+                    if _cancel_by_server:
+                        _cancel_marker['cancel_initiator'] = CANCEL_INITIATOR_SERVER
                     _cs.messages.append(_cancel_marker)
 
                 # A journal-only turn has no in-memory partial to carry into the
@@ -19348,6 +19387,8 @@ def cancel_stream(stream_id: str, reason: str | None = None) -> bool:
             _payload = _cancel_event_payload('Cancelled by user', session=_cancel_session_payload)
             if reason:
                 _payload['message'] = str(reason)
+            if _cancel_initiator_is_server(initiator):
+                _payload['cancel_initiator'] = CANCEL_INITIATOR_SERVER
             q.put_nowait(('cancel', _payload))
         except Exception:
             logger.debug("Failed to put cancel event to queue")

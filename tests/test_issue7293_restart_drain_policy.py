@@ -162,8 +162,8 @@ def test_settle_cancels_only_webui_owned_runs_with_reason(monkeypatch):
 
     calls = []
 
-    def fake_cancel(stream_id, reason=None):
-        calls.append((stream_id, reason))
+    def fake_cancel(stream_id, reason=None, **kw):
+        calls.append((stream_id, reason, kw.get("initiator")))
         _drop_run(stream_id)
         return True
 
@@ -176,6 +176,8 @@ def test_settle_cancels_only_webui_owned_runs_with_reason(monkeypatch):
 
     assert sorted(c[0] for c in calls) == ["legacy-a", "legacy-b"]
     assert all(c[1] == "server stopping" for c in calls)
+    # Server-initiated: the durable marker must not claim the user cancelled.
+    assert all(c[2] == streaming.CANCEL_INITIATOR_SERVER for c in calls)
     assert sorted(result["settled"]) == ["legacy-a", "legacy-b"]
     assert result["timed_out"] is False
     with config.ACTIVE_RUNS_LOCK:
@@ -187,7 +189,7 @@ def test_settle_is_bounded_when_cancel_hangs(monkeypatch):
 
     release = threading.Event()
 
-    def hanging_cancel(stream_id, reason=None):
+    def hanging_cancel(stream_id, reason=None, **_kw):
         release.wait(10)
         return True
 
@@ -243,7 +245,7 @@ def test_run_finishing_inside_budget_is_waited_for_not_settled(monkeypatch):
     from api import streaming
 
     settled = []
-    monkeypatch.setattr(streaming, "cancel_stream", lambda sid, reason=None: settled.append(sid))
+    monkeypatch.setattr(streaming, "cancel_stream", lambda sid, reason=None, **_kw: settled.append(sid))
     _add_run("legacy-finishing")
     stop = _StopRecorder()
     drain = run_drain.ShutdownDrain(stop, budget_seconds=5, settle_seconds=1, poll_seconds=0.02)
@@ -261,7 +263,7 @@ def test_run_exceeding_budget_is_settled_then_server_stops(monkeypatch):
 
     settled = []
 
-    def fake_cancel(stream_id, reason=None):
+    def fake_cancel(stream_id, reason=None, **_kw):
         settled.append((stream_id, reason))
         _drop_run(stream_id)
         return True
@@ -299,7 +301,7 @@ def test_second_signal_escalates_without_starting_a_second_drain(monkeypatch):
 
     settled = []
 
-    def fake_cancel(stream_id, reason=None):
+    def fake_cancel(stream_id, reason=None, **_kw):
         settled.append(stream_id)
         _drop_run(stream_id)
         return True
@@ -446,7 +448,7 @@ def test_forced_restart_settles_webui_runs_before_execv_and_leaves_gateway_runs(
 
     events = []
 
-    def fake_cancel(stream_id, reason=None):
+    def fake_cancel(stream_id, reason=None, **_kw):
         events.append(("cancel", stream_id, reason))
         _drop_run(stream_id)
         return True
@@ -481,7 +483,7 @@ def test_unforced_restart_wait_timeout_settles_instead_of_abandoning(monkeypatch
 
     events = []
 
-    def fake_cancel(stream_id, reason=None):
+    def fake_cancel(stream_id, reason=None, **_kw):
         events.append(("cancel", stream_id))
         _drop_run(stream_id)
         return True

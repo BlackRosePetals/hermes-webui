@@ -12547,7 +12547,11 @@ from api.streaming import (
     _CompactEchoIndex,
 )
 from api.gateway_chat import _run_gateway_chat_streaming, webui_gateway_chat_enabled
-from api.run_drain import assert_run_admission_open_locked, run_admission_closed_response  # #7293
+from api.run_drain import (  # #7293
+    RunAdmissionClosed,
+    assert_run_admission_open_locked,
+    run_admission_closed_response,
+)
 from api.run_journal import (
     runtime_model_from_events,
     _parse_run_journal_event_id as _shared_parse_run_journal_event_id,
@@ -28300,6 +28304,12 @@ def start_session_turn(
         }
     if not msg:
         return {"error": "message is required", "_status": 400}
+    # #7293: a server-initiated turn honours the same run-admission fence as a
+    # browser chat/start. The refusal is a retryable 503 dict (never a raise),
+    # so wakeup callers re-defer the prompt instead of dropping it.
+    _admission_refusal = run_admission_closed_response()
+    if _admission_refusal is not None:
+        return _admission_refusal
     stale_response = _agent_runtime_barrier_response(runner_local_owned=True)
     if stale_response is not None:
         stale_response["_status"] = 409
@@ -28448,21 +28458,29 @@ def start_session_turn(
                 }
     if _paused_wakeup_response is not None:
         return _paused_wakeup_response
-    resp = _start_run(
-        s,
-        msg=msg,
-        attachments=[],
-        workspace=workspace,
-        model=model,
-        model_provider=model_provider,
-        normalized_model=normalized_model,
-        source=turn_source,
-        route="start_session_turn",
-        process_id=process_id,
-        retry_attempt=retry_attempt,
-        rearm_deferred_wakeup=rearm_deferred_wakeup,
-        on_admitted=on_admitted,
-    )
+    try:
+        resp = _start_run(
+            s,
+            msg=msg,
+            attachments=[],
+            workspace=workspace,
+            model=model,
+            model_provider=model_provider,
+            normalized_model=normalized_model,
+            source=turn_source,
+            route="start_session_turn",
+            process_id=process_id,
+            retry_attempt=retry_attempt,
+            rearm_deferred_wakeup=rearm_deferred_wakeup,
+            on_admitted=on_admitted,
+        )
+    except RunAdmissionClosed as exc:
+        # #7293: the fence closed between the early check and the registration
+        # edge. The launch already compensated (session snapshot restored,
+        # journal closed as start_compensated); report the retryable refusal.
+        refusal = dict(exc.payload)
+        refusal["_status"] = exc.status
+        return refusal
 
     # ── Defect B: live-view of server-initiated turns ──────────────────────
     # Option Z starts this turn server-side, so NO browser EventSource is

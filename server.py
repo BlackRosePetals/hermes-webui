@@ -723,7 +723,7 @@ def main() -> None:
     # state. Instead the FIRST SIGTERM/SIGINT starts one bounded drain:
     # run admission closes (new chat starts get 503 server_draining), active
     # WebUI-owned runs may finish within HERMES_WEBUI_SHUTDOWN_DRAIN_SECONDS
-    # (default 15s), anything still running at the deadline is settled durably
+    # (default 90s), anything still running at the deadline is settled durably
     # as interrupted, then httpd.shutdown() lets serve_forever() return and the
     # `finally` below drains cleanly. A SECOND signal escalates to an immediate
     # settled stop; it never starts another drain. Gateway-backed runs keep

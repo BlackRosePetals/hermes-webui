@@ -8,7 +8,7 @@ Policy (owner-approved, "Option A"):
   between the safety check and the re-exec. A forced restart settles the
   remaining runs as durably interrupted before the process image is replaced.
 * An external SIGTERM/SIGINT gets ONE bounded drain: admission closes, active
-  runs may finish inside ``HERMES_WEBUI_SHUTDOWN_DRAIN_SECONDS`` (default 15s),
+  runs may finish inside ``HERMES_WEBUI_SHUTDOWN_DRAIN_SECONDS`` (default 90s),
   anything still running at the deadline is settled durably as interrupted,
   then the HTTP server stops.
 * A repeated signal escalates to an immediate settled stop. It never starts a
@@ -23,8 +23,8 @@ nothing here takes ``STREAMS_LOCK`` or ``ACTIVE_RUNS_LOCK`` while holding it.
 from __future__ import annotations
 
 import logging
-import math
 import os
+import re
 import sys
 import threading
 import time
@@ -35,7 +35,10 @@ from api import config as _config
 logger = logging.getLogger(__name__)
 
 SHUTDOWN_DRAIN_ENV = "HERMES_WEBUI_SHUTDOWN_DRAIN_SECONDS"
-DEFAULT_SHUTDOWN_DRAIN_SECONDS = 15.0
+# Owner-chosen default (#7293): long enough for a typical agent turn to finish.
+# A supervisor's stop timeout must exceed it (systemd ``TimeoutStopSec`` >=
+# budget + 30s, i.e. 120s for the default); see docs/supervisor.md.
+DEFAULT_SHUTDOWN_DRAIN_SECONDS = 90.0
 # Upper bound for an operator-supplied budget, so a typo cannot keep a server
 # half-stopped (admission closed) for days.
 MAX_SHUTDOWN_DRAIN_SECONDS = 3600.0
@@ -196,6 +199,10 @@ def _closed_payload(phase: str) -> dict:
         "code": "server_draining",
         "server_draining": True,
         "admission_phase": phase,
+        # Transient: the same request succeeds once the server is back (or the
+        # update hold is released). Server-side wakeup callers key their
+        # retry-without-consuming-budget handling off this flag.
+        "retryable": True,
     }
 
 
@@ -344,20 +351,25 @@ def settle_webui_owned_runs(reason: str, *, timeout: float = SHUTDOWN_SETTLE_SEC
 # ── Bounded shutdown drain ──────────────────────────────────────────────────
 
 
+# Plain decimal seconds only ("90", "7.5", ".5", "-1"). ctl.sh parses the same
+# grammar in pure bash to size its SIGTERM -> SIGKILL wait, so exponent forms,
+# "inf" and "nan" are rejected here too (default) rather than drifting apart.
+_BUDGET_RE = re.compile(r"^[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)$")
+
+
 def shutdown_drain_budget_seconds() -> float:
-    """``HERMES_WEBUI_SHUTDOWN_DRAIN_SECONDS``, clamped to [0, 3600]; default 15."""
+    """``HERMES_WEBUI_SHUTDOWN_DRAIN_SECONDS``, clamped to [0, 3600]; default 90."""
     raw = os.environ.get(SHUTDOWN_DRAIN_ENV)
     if raw is None or not str(raw).strip():
         return DEFAULT_SHUTDOWN_DRAIN_SECONDS
-    try:
-        value = float(str(raw).strip())
-    except (TypeError, ValueError):
+    text = str(raw).strip()
+    if not _BUDGET_RE.match(text):
         logger.warning(
-            "Ignoring invalid %s=%r; using %ss", SHUTDOWN_DRAIN_ENV, raw, DEFAULT_SHUTDOWN_DRAIN_SECONDS
+            "Ignoring invalid %s=%r (expected plain decimal seconds); using %ss",
+            SHUTDOWN_DRAIN_ENV, raw, DEFAULT_SHUTDOWN_DRAIN_SECONDS,
         )
         return DEFAULT_SHUTDOWN_DRAIN_SECONDS
-    if math.isnan(value):
-        return DEFAULT_SHUTDOWN_DRAIN_SECONDS
+    value = float(text)
     return min(max(0.0, value), MAX_SHUTDOWN_DRAIN_SECONDS)
 
 

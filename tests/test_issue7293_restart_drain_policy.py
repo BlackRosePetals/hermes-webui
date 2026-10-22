@@ -324,6 +324,16 @@ def test_second_signal_escalates_without_starting_a_second_drain(monkeypatch):
     assert drain._thread is first_thread
 
 
+def test_default_drain_budget_is_the_owner_chosen_90_seconds(monkeypatch):
+    monkeypatch.delenv("HERMES_WEBUI_SHUTDOWN_DRAIN_SECONDS", raising=False)
+    assert run_drain.DEFAULT_SHUTDOWN_DRAIN_SECONDS == 90.0
+    assert run_drain.shutdown_drain_budget_seconds() == 90.0
+    monkeypatch.setenv("HERMES_WEBUI_SHUTDOWN_DRAIN_SECONDS", "   ")
+    assert run_drain.shutdown_drain_budget_seconds() == 90.0
+    drain = run_drain.ShutdownDrain(lambda: None)
+    assert drain.budget_seconds == 90.0
+
+
 def test_drain_budget_comes_from_env(monkeypatch):
     monkeypatch.setenv("HERMES_WEBUI_SHUTDOWN_DRAIN_SECONDS", "7.5")
     assert run_drain.shutdown_drain_budget_seconds() == 7.5
@@ -331,6 +341,15 @@ def test_drain_budget_comes_from_env(monkeypatch):
     assert run_drain.shutdown_drain_budget_seconds() == run_drain.DEFAULT_SHUTDOWN_DRAIN_SECONDS
     monkeypatch.setenv("HERMES_WEBUI_SHUTDOWN_DRAIN_SECONDS", "-4")
     assert run_drain.shutdown_drain_budget_seconds() == 0.0
+    monkeypatch.setenv("HERMES_WEBUI_SHUTDOWN_DRAIN_SECONDS", " .5 ")
+    assert run_drain.shutdown_drain_budget_seconds() == 0.5
+    monkeypatch.setenv("HERMES_WEBUI_SHUTDOWN_DRAIN_SECONDS", "99999")
+    assert run_drain.shutdown_drain_budget_seconds() == run_drain.MAX_SHUTDOWN_DRAIN_SECONDS
+    # ctl.sh parses the same plain-decimal grammar in bash; anything else uses
+    # the default on BOTH sides so the stop wait never undercuts the drain.
+    for spelling in ("1e3", "inf", "nan", "1 0", "0x10", "--5"):
+        monkeypatch.setenv("HERMES_WEBUI_SHUTDOWN_DRAIN_SECONDS", spelling)
+        assert run_drain.shutdown_drain_budget_seconds() == 90.0, spelling
 
 
 # ── WebUI-initiated update/restart: refuse by default, explicit force ───────
@@ -515,6 +534,208 @@ def test_restart_that_does_not_replace_the_process_reopens_admission(monkeypatch
     while time.monotonic() < deadline and run_drain.run_admission_closed_response() is not None:
         time.sleep(0.02)
     assert run_drain.run_admission_closed_response() is None
+
+
+# ── Route edges: early refusal and the registration-edge race ───────────────
+
+_RACE_SESSION_ID = "drain-race-session"
+_RACE_STREAM_ID = "drain-race-stream"
+
+
+class _RaceSession:
+    """The attributes the launch path and its compensation read."""
+
+    def __init__(self):
+        self.session_id = _RACE_SESSION_ID
+        self.active_stream_id = _RACE_STREAM_ID
+        self.pending_user_message = "hello"
+        # Past the registration grace window, so the launch is not refused as
+        # a duplicate of itself before it reaches the registration edge.
+        self.pending_started_at = time.time() - 3600
+        self.messages = []
+        self.title = ""
+        self.worktree_path = None
+        self.pending_attachments = []
+        self.pending_user_source = "webui"
+        self.attachments = []
+        self.profile = None
+        self.model = "test-model"
+        self.model_provider = "test-provider"
+        self.workspace = "test-workspace"
+        self.saves = 0
+
+    def save(self, *args, **kwargs):
+        self.saves += 1
+
+
+class _RecordingHandler:
+    def __init__(self):
+        import io
+
+        self.wfile = io.BytesIO()
+        self.headers = {}
+        self.status = None
+
+    def send_response(self, status, *args, **kwargs):
+        self.status = status
+
+    def send_header(self, *args, **kwargs):
+        pass
+
+    def end_headers(self, *args, **kwargs):
+        pass
+
+    def body(self):
+        import json
+
+        raw = self.wfile.getvalue().decode("utf-8", "replace")
+        return json.loads(raw[raw.index("{"):]) if "{" in raw else {}
+
+
+class _NeverStartedThread:
+    started = []
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def start(self):
+        _NeverStartedThread.started.append(self)
+
+
+def test_chat_start_registration_edge_refusal_compensates_the_launch(monkeypatch):
+    """The fence closing between the early check and the registration edge.
+
+    ``RunAdmissionClosed`` is raised inside the launch ``try``: the existing
+    launch-failure compensation must restore the session snapshot, close the
+    submitted journal entry, and leave no registered stream, launch claim or
+    worker behind.
+    """
+    import types as _types
+
+    import api.routes as routes
+    import api.session_ops as session_ops
+    import api.turn_journal as turn_journal
+
+    restored = []
+    journal = []
+    _NeverStartedThread.started = []
+    monkeypatch.setattr(routes.threading, "Thread", _NeverStartedThread)
+    monkeypatch.setattr(routes.uuid, "uuid4", lambda: _types.SimpleNamespace(hex=_RACE_STREAM_ID))
+    # The real preparation publishes the new turn on the session; the
+    # compensation only restores a session that still points at this launch.
+    monkeypatch.setattr(
+        routes,
+        "_prepare_chat_start_session_for_stream",
+        lambda s, **k: setattr(s, "active_stream_id", k["stream_id"]),
+    )
+    monkeypatch.setattr(session_ops, "snapshot_session_state", lambda s: {"snap": True})
+    monkeypatch.setattr(session_ops, "restore_session_state", lambda s, snap: restored.append(snap))
+
+    def _journal(session_id, event):
+        journal.append(dict(event))
+        return {"turn_id": "turn-1"}
+
+    monkeypatch.setattr(turn_journal, "append_turn_journal_event", _journal)
+    monkeypatch.setattr(routes, "set_last_workspace", lambda *a, **k: None)
+    monkeypatch.setattr(routes, "webui_gateway_chat_enabled", lambda cfg: False)
+    monkeypatch.setattr(routes, "_get_session_agent_lock", lambda sid: threading.Lock())
+    session = _RaceSession()
+    session.active_stream_id = None
+    session.pending_user_message = None
+    monkeypatch.setattr(routes, "get_session", lambda sid: session)
+
+    run_drain.hold_run_admission("update:webui")
+    with pytest.raises(run_drain.RunAdmissionClosed) as exc_info:
+        routes._start_chat_stream_for_session(
+            session,
+            msg="hello",
+            attachments=[],
+            workspace="test-workspace",
+            model="test-model",
+            model_provider="test-provider",
+            external_runtime_owned=False,
+        )
+
+    assert exc_info.value.status == 503
+    assert _RACE_STREAM_ID not in config.STREAMS
+    assert _RACE_STREAM_ID not in config.PRE_ADMISSION_CLAIMS
+    assert _NeverStartedThread.started == [], "no worker may start behind a closed fence"
+    assert restored == [{"snap": True}], "the pre-launch session snapshot was not restored"
+    assert [e.get("event") for e in journal] == ["submitted", "interrupted"]
+    assert journal[-1].get("reason") == "start_compensated"
+
+
+def test_btw_registration_edge_refusal_leaves_no_registered_stream(monkeypatch):
+    import types as _types
+
+    import api.background as background
+    import api.models as models
+    import api.routes as routes
+
+    _NeverStartedThread.started = []
+    monkeypatch.setattr(
+        routes,
+        "threading",
+        _types.SimpleNamespace(Thread=_NeverStartedThread, Lock=threading.Lock, Event=threading.Event),
+    )
+    monkeypatch.setattr(routes.uuid, "uuid4", lambda: _types.SimpleNamespace(hex=_RACE_STREAM_ID))
+    monkeypatch.setattr(routes, "_agent_runtime_barrier_response", lambda **k: None)
+    monkeypatch.setattr(routes, "_session_is_subagent_view_only", lambda sid: False)
+    parent = _RaceSession()
+    parent.active_stream_id = None
+    monkeypatch.setattr(routes, "get_session", lambda sid: parent)
+    monkeypatch.setattr(models, "new_session", lambda **kwargs: _RaceSession())
+    tracked = []
+    monkeypatch.setattr(background, "track_btw", lambda *a, **k: tracked.append(a))
+    # Simulate losing the race: the cheap early check saw an open fence.
+    monkeypatch.setattr(routes, "run_admission_closed_response", lambda: None)
+
+    run_drain.hold_run_admission("update:webui")
+    with pytest.raises(run_drain.RunAdmissionClosed):
+        routes._handle_btw(_RecordingHandler(), {"session_id": "parent", "question": "what time is it"})
+
+    assert _RACE_STREAM_ID not in config.STREAMS
+    assert _RACE_STREAM_ID not in config.PRE_ADMISSION_CLAIMS
+    assert _NeverStartedThread.started == []
+    assert tracked == [], "a refused /btw must not be tracked as running"
+
+
+def test_chat_start_early_refusal_is_503_before_any_session_work(monkeypatch):
+    import api.routes as routes
+
+    monkeypatch.setattr(
+        routes, "_get_or_materialize_session", lambda *a, **k: pytest.fail("session touched")
+    )
+
+    class _Diag:
+        finished = 0
+
+        def stage(self, *_a, **_k):
+            pass
+
+        def finish(self):
+            _Diag.finished += 1
+
+    run_drain.begin_shutdown_drain()
+    handler = _RecordingHandler()
+    routes._handle_chat_start(handler, {"session_id": "s1", "message": "hi"}, diag=_Diag())
+    assert handler.status == 503
+    body = handler.body()
+    assert body.get("code") == "server_draining"
+    assert body.get("retryable") is True
+    assert "_status" not in body
+    assert _Diag.finished == 1, "the request diagnostics must still be finished"
+
+
+def test_server_initiated_turn_gets_a_retryable_refusal_not_a_raise(monkeypatch):
+    import api.routes as routes
+
+    monkeypatch.setattr(routes, "get_session", lambda *a, **k: pytest.fail("session touched"))
+    run_drain.hold_run_admission("update:webui")
+    resp = routes.start_session_turn("s1", "[IMPORTANT: process finished]")
+    assert resp["_status"] == 503
+    assert resp["code"] == "server_draining"
+    assert resp["retryable"] is True
 
 
 # ── Wiring guards ────────────────────────────────────────────────────────────

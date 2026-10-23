@@ -1972,7 +1972,8 @@ def _cancel_initiator_is_server(initiator) -> bool:
 
 
 # stream_id -> reason, for runs a server settle is cancelling (#7293). Recorded
-# before the cancellation is published. When the settle cannot get the session
+# on the cancellation's STREAMS_LOCK publication edge, after the durable-Gateway
+# check, before the cancellation is published. When the settle cannot get the session
 # lock in time it falls back to interrupting first, and the released worker may
 # then finalize the turn itself; it reads this to write the server marker and
 # keep the partial output instead of the user-cancel copy. Dropped by the
@@ -18955,7 +18956,6 @@ def cancel_stream(
     """
     if not _cancel_initiator_is_server(initiator):
         return _cancel_stream_impl(stream_id, reason, initiator=initiator)
-    _SERVER_SETTLE_REASONS[str(stream_id)] = str(reason or '').strip() or 'Task cancelled.'
     held_lock = _settle_session_lock_for_stream(stream_id)
     deferred_interrupts: list = []
     try:
@@ -19000,6 +19000,7 @@ def _cancel_stream_impl(
     ordering (streaming thread does LOCK → STREAMS_LOCK; inverting would deadlock).
     """
     from api import config as _live_config
+    from api.gateway_chat import gateway_run_durably_resumable
 
     # Use module-level aliases (imported from api.config at startup).
     # In production these are always the same objects as api.config.STREAMS etc.
@@ -19037,6 +19038,13 @@ def _cancel_stream_impl(
     _cancel_session_payload = None
 
     with streams_lock:
+        if _cancel_initiator_is_server(initiator) and gateway_run_durably_resumable(stream_id):
+            # #7293: a Gateway run a restart reattaches is never server-settled. Its
+            # durable handoff is published on this same lock only while the stream is
+            # still registered and uncancelled, so either it is visible here (leave
+            # the run, its stream and its session untouched) or the cancellation below
+            # wins and the handoff refuses to admit the run.
+            return False
         stream_present = stream_id in streams
         # Snapshot everything the worker's finally could pop, WHILE the lock is
         # held and before any interrupt lets that finally run — for BOTH the
@@ -19090,6 +19098,10 @@ def _cancel_stream_impl(
                 active_run_entry = None
             if active_run_entry and not active_run_session_id:
                 active_run_session_id = str(active_run_entry.get("session_id") or "").strip() or None
+
+        if _cancel_initiator_is_server(initiator):
+            # Before publication, so a worker released by the cancel reads it.
+            _SERVER_SETTLE_REASONS[str(stream_id)] = str(reason or '').strip() or 'Task cancelled.'
 
         # Mark the worker lifecycle registry immediately. The SSE maps may be popped
         # below while the worker is still unwinding; ACTIVE_RUNS is what recovery /

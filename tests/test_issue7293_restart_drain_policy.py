@@ -210,9 +210,15 @@ def test_record_gateway_run_marks_durable_only_after_a_successful_save(tmp_path,
     s.save()
     models.SESSIONS["s7293_gw"] = s
     try:
-        # Not the current stream: nothing is saved, so nothing is resumable.
-        gateway_chat._record_gateway_run("s7293_gw", "gw-other", None, request={"input": "x"})
+        # Not the current stream: nothing is saved, so nothing is resumable, and
+        # the initial handoff refuses so the launch never POSTs (release gate f2).
+        with pytest.raises(gateway_chat.GatewayHandoffCancelled):
+            gateway_chat._record_gateway_run("s7293_gw", "gw-other", None, request={"input": "x"})
         assert gateway_chat.gateway_run_durably_resumable("gw-other") is False
+        assert Session.load("s7293_gw").gateway_run is None
+        # Durability is published only while the stream is still registered.
+        with config.STREAMS_LOCK:
+            config.STREAMS["gw-st"] = object()
 
         # The save fails: the request record is not durable (the launch fails).
         def failing_save(*_a, **_kw):

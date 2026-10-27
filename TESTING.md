@@ -362,7 +362,10 @@ cdn.jsdelivr.net, so the gate needs network access. Run it locally with
 `python tests/browser_terminal_screen_reader_mode.py`. Manual check with a
 screen reader (for example NVDA + Firefox): with the preference on, typed
 input and new terminal output are read, and the visible rows can be read in
-browse mode.
+browse mode. Known limitation (xterm.js 5.3, upstream issue #3679): with the
+mode on, xterm ignores input events that arrive without a keydown, so text from
+dictation, some IMEs and Android soft keyboards may not reach the shell. Real
+key presses work in both modes.
 
 It then runs `tests/browser_file_tree_keyboard.py`, which starts the server with
 a temporary default workspace and drives the Files tab from the keyboard in

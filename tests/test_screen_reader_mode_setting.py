@@ -107,3 +107,18 @@ def test_settings_checkbox_is_labelled_described_and_translated():
     locales = len(re.findall(r"settings_label_terminal_auto_expand:", I18N_JS))
     assert I18N_JS.count("settings_label_screen_reader_mode:") == locales
     assert I18N_JS.count("settings_desc_screen_reader_mode:") == locales
+
+
+def test_settings_search_finds_the_row_by_accessibility_terms():
+    """Settings search reads data-settings-search, so people looking for "accessibility" or a screen reader's name
+    find the row (the label alone only matches "screen reader")."""
+    row = re.search(
+        r'<div class="settings-field" data-settings-search="([^"]*)">\s*<label[^>]*>\s*'
+        r'<input type="checkbox" id="settingsScreenReaderMode"',
+        INDEX_HTML,
+    )
+    assert row, "the Screen reader mode row must carry data-settings-search keywords"
+    terms = row.group(1).lower().split()
+    for term in ("accessibility", "a11y", "nvda", "voiceover", "terminal"):
+        assert term in terms, term
+    assert "settingsSearch" in PANELS_JS, "Settings search must still read data-settings-search"

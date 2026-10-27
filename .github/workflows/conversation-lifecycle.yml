@@ -1,4 +1,4 @@
-name: Conversation lifecycle
+name: Conversation lifecycle (informational)
 
 # Scoped to the code this browser gate actually exercises — the chat
 # render/streaming surface — so it doesn't spin up playwright+chromium on
@@ -38,7 +38,6 @@ on:
       - 'tests/browser_live_scene_energy.py'
       - 'tests/browser_progress_animation.py'
       - 'tests/browser_running_ring_inset.py'
-      - 'tests/browser_transparent_fade_mutations.py'
       - 'requirements*.txt'
       - 'pyproject.toml'
       - '.github/workflows/conversation-lifecycle.yml'

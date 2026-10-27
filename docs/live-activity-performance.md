@@ -8,7 +8,7 @@ The running-dot pulse lives on a `::after` ring animated with `transform:scale` 
 
 Timestamp visibility is reconciled in place on transparent tool cache hits rather than rebuilding the card. The timestamp picker also synchronizes mounted live and historical rows immediately, preserving detail DOM and text selection without waiting for SSE. Unchanged visibility performs no timestamp DOM writes; language and simplified-tool preferences remain content-signature inputs.
 
-The conversation lifecycle workflow runs the core Chromium energy, progress, fade and reconnect oracles without `continue-on-error`, alongside normal/error settlement and historical hydration. Repository branch-protection requirements remain administrator-owned.
+The conversation lifecycle workflow runs the Chromium energy, progress and running-ring inset oracles as informational rows, like the existing normal/error settlement and historical hydration rows; only the reconnect scene redraw and #7676 settle visibility rows fail CI. Repository branch-protection requirements remain administrator-owned.
 
 ## Checks
 

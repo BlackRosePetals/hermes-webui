@@ -101,6 +101,11 @@ BUFFER_HAS_TEXT = (
     "{const l=b.getLine(i);if(l&&l.translateToString(true).trim())return true}"
     "return false})()"
 )
+SHORT_PROMPT_SHOWN = (
+    "(()=>{const b=TERMINAL_UI.term.buffer.active;for(let i=0;i<b.length;i++)"
+    "{const l=b.getLine(i);if(l&&l.translateToString(true).trim()==='$')return true}"
+    "return false})()"
+)
 TREE = "!!document.querySelector('#terminalSurface .xterm-accessibility-tree')"
 TREE_HAS_MARKER_ROW = (
     "[...document.querySelectorAll('#terminalSurface .xterm-accessibility-tree > div')]"
@@ -182,6 +187,19 @@ def _check(browser, name):
         ctx.close()
         return [f"  [{name}] the shell printed no prompt"]
     page.evaluate("focusComposerTerminalInput()")
+    # Set a short prompt first. xterm's accessibility tree mirrors only the viewport, and
+    # opening Settings resizes the terminal, so the shell redraws its prompt as narrow
+    # fragments. A long prompt (a long $TMPDIR in the cwd, as on macOS) then pushes the
+    # marker above the viewport and the check below fails on a working build.
+    with page.expect_response(
+        lambda r: "/api/terminal/input" in r.url and r.request.method == "POST",
+        timeout=10000,
+    ):
+        page.keyboard.insert_text("PS1='$ '")
+    page.keyboard.press("Enter")
+    if not _wait_until(page, SHORT_PROMPT_SHOWN, 10000):
+        ctx.close()
+        return [f"  [{name}] the shell did not show the short prompt"]
     # Send the command as one input POST and wait for it before Enter. Typing key by
     # key sends one POST per character, and those can reach the shell out of order.
     with page.expect_response(

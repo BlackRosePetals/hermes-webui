@@ -4670,6 +4670,7 @@ body.resizing .sidebar{transition:none!important;}
 .transparent-event-row[data-transparent-fade="3"]{opacity:.68;}
 .transparent-event-row[data-transparent-fade="4"]{opacity:.6;}
 .transparent-event-row[data-transparent-fade="5"]{opacity:.54;}
+.transparent-event-row[data-transparent-fade]{transition:opacity .22s ease;}
 .transparent-event-row[data-transparent-fade]:hover{opacity:1;}
 
 /* ── Collapsible Hermes chat name tag ───────── */

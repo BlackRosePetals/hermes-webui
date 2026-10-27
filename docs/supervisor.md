@@ -75,8 +75,8 @@ before it falls back to ``SIGKILL``.
 
 Updates started from the WebUI's update banner follow the same rule from the
 other side: while WebUI agent runs are active the update is refused with the
-run count, and the banner offers an explicit **Force update (interrupts N
-runs)**. A forced update settles those runs as interrupted before the server
+run count, and the banner offers an explicit **Update anyway (interrupts N
+runs)**. That update settles those runs as interrupted before the server
 re-executes itself.
 
 ### The supervisor's stop timeout must outlast the drain

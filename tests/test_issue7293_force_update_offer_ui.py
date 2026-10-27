@@ -240,7 +240,7 @@ def test_refusal_renders_force_offer_with_active_run_count(tmp_path):
     refusal = out["afterRefusal"]
     assert refusal["offer"] == {
         "count": 1,
-        "label": "Force update (interrupts 2 runs)",
+        "label": "Update anyway (interrupts 2 runs)",
         "target": "webui",
         "disabled": False,
         "connected": True,
@@ -260,7 +260,7 @@ def test_single_run_label_is_singular(tmp_path):
         {"entry": "apply", "target": "webui", "updateData": _WEBUI_BEHIND, "responses": [_refusal(1)]},
         tmp_path,
     )
-    assert out["afterRefusal"]["offer"]["label"] == "Force update (interrupts 1 run)"
+    assert out["afterRefusal"]["offer"]["label"] == "Update anyway (interrupts 1 run)"
 
 
 def test_confirming_the_offer_resends_with_force_active_runs(tmp_path):
@@ -318,7 +318,7 @@ def test_cancelling_the_offer_sends_nothing(tmp_path):
     # The offer stays available and usable after a cancel.
     assert out["afterClick"]["offer"] == {
         "count": 1,
-        "label": "Force update (interrupts 3 runs)",
+        "label": "Update anyway (interrupts 3 runs)",
         "target": "webui",
         "disabled": False,
         "connected": True,
@@ -356,7 +356,7 @@ def test_repeated_refusals_keep_a_single_offer(tmp_path):
         tmp_path,
     )
     assert out["afterRefusal"]["offer"]["count"] == 1
-    assert out["afterRefusal"]["offer"]["label"] == "Force update (interrupts 4 runs)"
+    assert out["afterRefusal"]["offer"]["label"] == "Update anyway (interrupts 4 runs)"
 
 
 def test_clear_lock_refusal_offer_resends_clear_lock_with_force(tmp_path):
@@ -370,7 +370,7 @@ def test_clear_lock_refusal_offer_resends_clear_lock_with_force(tmp_path):
         },
         tmp_path,
     )
-    assert out["afterRefusal"]["offer"]["label"] == "Force update (interrupts 1 run)"
+    assert out["afterRefusal"]["offer"]["label"] == "Update anyway (interrupts 1 run)"
     assert out["apiCalls"] == [
         {"url": "/api/updates/clear_lock", "body": {"target": "webui"}},
         {"url": "/api/updates/clear_lock", "body": {"target": "webui", "force_active_runs": True}},

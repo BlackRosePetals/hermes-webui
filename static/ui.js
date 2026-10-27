@@ -14168,7 +14168,7 @@ function _renderActiveRunsForceOffer(target,res,resend){
   const rawCount=Number(res&&res.active_runs)||Number(res&&res.active_streams)||1;
   const count=Math.max(1,Math.floor(rawCount));
   const plural=count===1?'':'s';
-  const label=_activeRunsUpdateText('update_force_active_runs',count,'Force update (interrupts '+count+' run'+plural+')');
+  const label=_activeRunsUpdateText('update_force_active_runs',count,'Update anyway (interrupts '+count+' run'+plural+')');
   const actions=document.createElement('div');
   actions.style.marginTop='6px';
   const btn=document.createElement('button');

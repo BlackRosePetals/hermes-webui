@@ -7408,10 +7408,32 @@ async function toggleModelDropdown(){
   _focusModelPicker(dd);
 }
 
+// Closing a picker that still holds keyboard focus hands focus back to the button
+// that opened it (the menu-button pattern). Otherwise the focused node is hidden,
+// focus falls to <body>, Tab restarts at the page edge, and the next `k` switches
+// the conversation through the global J/K binding (which ignores keys on buttons).
+// Only when focus is still inside the picker: a close caused by a click elsewhere,
+// or by another panel that already moved focus, keeps that target. Must run before
+// the phone path's reparent in closeModelDropdown, which detaches the focused node.
+function _returnModelPickerFocus(dd, anchors){
+  if(!dd||typeof document==='undefined') return;
+  const active=document.activeElement;
+  if(!active||!(active===dd||(typeof dd.contains==='function'&&dd.contains(active)))) return;
+  for(const el of anchors||[]){
+    if(!el||el.disabled||typeof el.focus!=='function') continue;
+    // A display:none anchor (the desktop chip on a phone, the phone action on a
+    // desktop) has no layout box, and focusing it would be a silent no-op.
+    if(typeof el.getClientRects==='function'&&!el.getClientRects().length) continue;
+    try{el.focus({preventScroll:true});}catch(_){continue;}
+    if(document.activeElement===el) return;
+  }
+}
+
 function closeModelDropdown(){
   const dd=$('composerModelDropdown');
   const chip=$('composerModelChip');
   const mobileAction=$('composerMobileModelAction');
+  if(dd&&dd.classList.contains('open')) _returnModelPickerFocus(dd,[mobileAction,chip]);
   if(dd) dd.classList.remove('open');
   if(chip) chip.classList.remove('active');
   if(mobileAction) mobileAction.classList.remove('active');
@@ -7424,6 +7446,7 @@ function closeModelDropdown(){
 function closeSettingsModelDropdown(){
   const dd=$('settingsModelDropdown');
   const chip=$('settingsModelChip');
+  if(dd&&dd.classList.contains('open')) _returnModelPickerFocus(dd,[chip]);
   if(dd) dd.classList.remove('open');
   if(chip){
     chip.classList.remove('active');

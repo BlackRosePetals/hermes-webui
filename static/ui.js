@@ -7398,8 +7398,12 @@ async function toggleModelDropdown(){
   if(activeRow&&typeof activeRow.scrollIntoView==='function') activeRow.scrollIntoView({block:'center'});
   _nudgeModelRowBelowStickyStack(dd,activeRow);
   chip.classList.add('active');
+  chip.setAttribute('aria-expanded','true');
   const mobileAction=$('composerMobileModelAction');
-  if(mobileAction) mobileAction.classList.add('active');
+  if(mobileAction){
+    mobileAction.classList.add('active');
+    mobileAction.setAttribute('aria-expanded','true');
+  }
   // Hand keyboard focus to the target this device expects: the search box when a
   // keyboard is in play (type immediately, IME works), the container on a
   // touch-only device (no software keyboard over the list). Runs AFTER
@@ -7433,10 +7437,16 @@ function closeModelDropdown(){
   const dd=$('composerModelDropdown');
   const chip=$('composerModelChip');
   const mobileAction=$('composerMobileModelAction');
-  if(dd&&dd.classList.contains('open')) _returnModelPickerFocus(dd,[mobileAction,chip]);
+  if(dd&&dd.classList.contains('open')&&typeof _returnModelPickerFocus==='function') _returnModelPickerFocus(dd,[mobileAction,chip]);
   if(dd) dd.classList.remove('open');
-  if(chip) chip.classList.remove('active');
-  if(mobileAction) mobileAction.classList.remove('active');
+  if(chip){
+    chip.classList.remove('active');
+    chip.setAttribute('aria-expanded','false');
+  }
+  if(mobileAction){
+    mobileAction.classList.remove('active');
+    mobileAction.setAttribute('aria-expanded','false');
+  }
   // If the phone path reparented the menu onto <body>, put it back in the
   // footer and clear the fixed-position inline styles so the DOM returns to its
   // baseline shape and the next desktop open anchors correctly (#6080).
@@ -7446,7 +7456,7 @@ function closeModelDropdown(){
 function closeSettingsModelDropdown(){
   const dd=$('settingsModelDropdown');
   const chip=$('settingsModelChip');
-  if(dd&&dd.classList.contains('open')) _returnModelPickerFocus(dd,[chip]);
+  if(dd&&dd.classList.contains('open')&&typeof _returnModelPickerFocus==='function') _returnModelPickerFocus(dd,[chip]);
   if(dd) dd.classList.remove('open');
   if(chip){
     chip.classList.remove('active');

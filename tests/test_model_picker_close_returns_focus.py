@@ -23,9 +23,11 @@ NODE = shutil.which("node")
 _DRIVER = r"""
 const fs = require('fs');
 const ui = fs.readFileSync(process.argv[2], 'utf8');
-function extractFunc(name, optional) {
+// Optional so the pre-fold code still runs and fails on behaviour, not on extraction.
+const OPTIONAL = new Set(['_returnModelPickerFocus']);
+function extractFunc(name) {
   const start = ui.search(new RegExp('function\\s+' + name + '\\s*\\('));
-  if (start < 0) { if (optional) return ''; throw new Error(name + ' not found'); }
+  if (start < 0) { if (OPTIONAL.has(name)) return ''; throw new Error(name + ' not found'); }
   let i = ui.indexOf('{', ui.indexOf(')', start));
   let depth = 1; i++;
   while (depth > 0 && i < ui.length) { if (ui[i] === '{') depth++; else if (ui[i] === '}') depth--; i++; }
@@ -51,10 +53,13 @@ function scenario(name, build) {
   active = null; restored = 0;
   const env = build();
   const $ = (id) => env.ids[id] || null;
-  // Optional so the pre-fold code still runs and fails on behaviour, not on extraction.
-  eval(extractFunc('_returnModelPickerFocus', true) + extractFunc('closeModelDropdown') + extractFunc('closeSettingsModelDropdown') +
-       ';env.run($, closeModelDropdown, closeSettingsModelDropdown);');
-  results[name] = { active: active ? active.id : null, open: env.dd ? env.dd.classList.contains('open') : null, restored };
+  eval(extractFunc('_returnModelPickerFocus'));
+  eval(extractFunc('closeModelDropdown'));
+  eval(extractFunc('closeSettingsModelDropdown'));
+  env.run($, closeModelDropdown, closeSettingsModelDropdown);
+  const chip = env.ids.composerModelChip || env.ids.settingsModelChip;
+  results[name] = { active: active ? active.id : null, open: env.dd ? env.dd.classList.contains('open') : null, restored,
+                    expanded: chip ? chip['aria-expanded'] : null };
 }
 function composer(o) {
   const dd = node('composerModelDropdown', { cls: o.open === false ? [] : ['open'] });
@@ -92,7 +97,7 @@ def results(tmp_path_factory):
 
 
 def test_closing_the_composer_picker_from_its_search_box_focuses_the_chip(results):
-    assert results["search_focused_desktop"] == {"active": "composerModelChip", "open": False, "restored": 1}
+    assert results["search_focused_desktop"] == {"active": "composerModelChip", "open": False, "restored": 1, "expanded": "false"}
 
 
 def test_touch_container_focus_returns_to_the_visible_phone_action(results):
@@ -101,7 +106,7 @@ def test_touch_container_focus_returns_to_the_visible_phone_action(results):
 
 
 def test_no_visible_anchor_leaves_focus_alone_and_still_closes(results):
-    assert results["no_visible_anchor"] == {"active": "search", "open": False, "restored": 1}
+    assert results["no_visible_anchor"] == {"active": "search", "open": False, "restored": 1, "expanded": "false"}
 
 
 def test_a_close_after_focus_moved_elsewhere_does_not_steal_it(results):
@@ -113,4 +118,21 @@ def test_closing_an_already_closed_picker_moves_nothing(results):
 
 
 def test_closing_the_settings_picker_from_its_search_box_focuses_its_chip(results):
-    assert results["settings_search_focused"] == {"active": "settingsModelChip", "open": False, "restored": 0}
+    assert results["settings_search_focused"] == {"active": "settingsModelChip", "open": False, "restored": 0, "expanded": "false"}
+
+
+def test_closing_resets_the_disclosure_state_on_every_path(results):
+    # The chips follow the WAI-ARIA disclosure pattern (aria-expanded + aria-controls; the
+    # popup is role=group, so no aria-haspopup value applies). Every close reports collapsed.
+    for name in ("search_focused_desktop", "container_focused_touch", "focus_outside_kept", "already_closed"):
+        assert results[name].get("expanded") == "false", name
+
+
+def test_triggers_declare_the_disclosure_pattern_not_a_listbox():
+    html = (UI_JS.parent / "index.html").read_text()
+    for chip in ("composerModelChip", "composerMobileModelAction", "settingsModelChip"):
+        start = html.index(f'id="{chip}"')
+        tag = html[html.rindex("<button", 0, start):html.index(">", start)]
+        assert 'aria-expanded="false"' in tag, chip
+        assert 'aria-controls="' in tag, chip
+        assert "aria-haspopup" not in tag, chip

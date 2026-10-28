@@ -12695,7 +12695,16 @@ function _recordProjectPickerContextPoint(anchorEl,event){
   // freshMenuAnchor marks the point as the spot a menu was just invoked from.
   // _openSessionActionMenu consumes the flag and _positionSessionActionMenu
   // places a context-menu-opened action menu there (and follows the row).
-  const point={clientX:event.clientX,clientY:event.clientY,freshMenuAnchor:true};
+  // The point itself is always recorded (the project picker reads it), but only
+  // a pointer right-click on the row is a place to open the menu at. A keyboard
+  // open (Shift+F10 or the ContextMenu key: button -1, fired at the focused
+  // trigger's centre) and a right-click on the trigger itself open on the
+  // button, exactly as a click on it does.
+  const target=event.target;
+  const onTrigger=!!(target&&target.closest&&target.closest('.session-actions-trigger'));
+  const fromKeyboard=event.button<0;
+  const point={clientX:event.clientX,clientY:event.clientY};
+  if(!onTrigger&&!fromKeyboard) point.freshMenuAnchor=true;
   const row=anchorEl.closest&&anchorEl.closest('.session-child-session-fork,.session-item');
   if(row&&row.isConnected!==false){
     const rowRect=row.getBoundingClientRect();

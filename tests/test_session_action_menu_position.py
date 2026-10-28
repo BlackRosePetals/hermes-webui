@@ -185,3 +185,43 @@ def test_right_click_keeps_masters_point_recording_and_open_form():
     assert "_sessionActionPointer" not in SESSIONS_JS
     assert "function _openSessionActionMenu(session, anchorEl){" in SESSIONS_JS
     assert "function _mountSessionActionMenu(menu, session, anchorEl){" in SESSIONS_JS
+
+
+def _record_for(event_js: str):
+    script = (
+        _record_point_source()
+        + r"""
+const anchor = {closest: sel => sel === '.session-child-session-fork,.session-item'
+  ? {isConnected: true, getBoundingClientRect: () => ({left: 16, top: 380})} : null};
+const onTrigger = {closest: sel => sel === '.session-actions-trigger' ? {} : null};
+const onTitle = {closest: () => null};
+_recordProjectPickerContextPoint(anchor, """
+        + event_js
+        + r""");
+console.log(JSON.stringify(anchor._projectPickerContextPoint));
+"""
+    )
+    return _run_node(script)
+
+
+def test_keyboard_context_menu_opens_on_the_button():
+    """Shift+F10 / the ContextMenu key fire contextmenu with button -1 at the
+    focused trigger's centre (Chromium 149). That is not a pointer position:
+    the menu must open on the button as a click does, not over the chat pane."""
+    data = _record_for("{clientX: 357, clientY: 315, button: -1, target: onTrigger}")
+    assert "freshMenuAnchor" not in data, f"a keyboard open must not anchor at a point; got {data}"
+    assert (data["clientX"], data["clientY"]) == (357, 315), "the point itself is still recorded"
+    data = _record_for("{clientX: 200, clientY: 400, button: -1, target: onTitle}")
+    assert "freshMenuAnchor" not in data, f"button -1 is a keyboard open wherever it lands; got {data}"
+
+
+def test_right_click_on_the_trigger_opens_on_the_button():
+    """A mouse right-click on the row's own trigger opens where a click on it
+    does, instead of covering the trigger with the menu's corner."""
+    data = _record_for("{clientX: 357, clientY: 315, button: 2, target: onTrigger}")
+    assert "freshMenuAnchor" not in data, f"right-click on the trigger must open on the button; got {data}"
+
+
+def test_right_click_on_the_row_still_opens_at_the_pointer():
+    data = _record_for("{clientX: 120, clientY: 400, button: 2, target: onTitle}")
+    assert data.get("freshMenuAnchor") is True, f"a row right-click must keep the pointer placement; got {data}"

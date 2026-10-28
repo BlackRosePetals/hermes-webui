@@ -136,3 +136,16 @@ def test_triggers_declare_the_disclosure_pattern_not_a_listbox():
         assert 'aria-expanded="false"' in tag, chip
         assert 'aria-controls="' in tag, chip
         assert "aria-haspopup" not in tag, chip
+
+
+def test_escape_in_the_picker_stops_at_the_picker():
+    # The document-level Escape handler (boot.js) closes the Settings panel, clears the
+    # session search and cancels a message edit. Escape inside an open picker must close
+    # only the picker; a second Escape reaches those. Browser proof: RM release review.
+    src = UI_JS.read_text()
+    start = src.index("const _modelPickerKey=(e)=>{")
+    branch = src[start:src.index("return;}", start)]
+    assert "e.stopPropagation()" in branch and "closeDropdown()" in branch
+    custom = src[src.index("_ci.addEventListener('keydown'"):]
+    custom = custom[:custom.index("});") + 3]
+    assert "e.stopPropagation();closeDropdown()" in custom

@@ -7259,7 +7259,10 @@ function renderModelDropdown(){
   // container (touch-only open). Escape closes, arrows move the highlight, Enter
   // picks it, and a printable character starts a search.
   const _modelPickerKey=(e)=>{
-    if(e.key==='Escape'){closeDropdown();return;}
+    // Innermost layer first: stop the key here so the document-level Escape handler
+    // (boot.js) does not also close the Settings panel, clear the session search or
+    // cancel a message edit behind the picker. A second Escape reaches those.
+    if(e.key==='Escape'){e.preventDefault();e.stopPropagation();closeDropdown();return;}
     // Printable character while the CONTAINER holds focus (touch-only device with
     // a hardware keyboard, or a container focused by assistive tech). Hand it to
     // the search box. Without preventDefault+stopPropagation the key ALSO reaches
@@ -7314,7 +7317,7 @@ function renderModelDropdown(){
   _sc.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){ _si.value=''; _filterModels(''); _si.focus(); e.preventDefault(); }});
   const _applyCustom=()=>{const v=_ci.value.trim();if(!v)return;selectFromDropdown(v,null);_ci.value='';};
   _cb.onclick=_applyCustom;
-  _ci.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();_applyCustom();}if(e.key==='Escape'){closeDropdown();}});
+  _ci.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();_applyCustom();}if(e.key==='Escape'){e.preventDefault();e.stopPropagation();closeDropdown();}});
   _ci.addEventListener('click',e=>e.stopPropagation());
   dd.appendChild(_scopeNote);
   dd.appendChild(_searchRow);

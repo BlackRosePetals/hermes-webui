@@ -82,6 +82,7 @@ from api.run_journal import RunJournalWriter
 from api.todo_state import attach_todo_state, emit_todo_state
 from api.turn_journal import append_turn_journal_event_for_stream
 from api.usage import prompt_cache_hit_percent
+from api.memory_profile_scope import construct_profile_scoped_agent, session_profile_home_or_empty
 from api.models import (
     StateDBSessionMessagesSnapshot,
     _cancelled_journal_turn_owner,
@@ -14472,7 +14473,9 @@ def _run_agent_streaming(
             _profile_runtime_env = get_profile_runtime_env(_profile_home_path)
             _safe_profile_runtime_env = filter_runtime_env_for_gateway_parity(_profile_runtime_env)
         except ImportError:
-            _profile_home = os.environ.get('HERMES_HOME', '')
+            # #8517: never the shared HERMES_HOME env mirror (another profile's
+            # worker may hold it); '' turns memory off for the turn.
+            _profile_home = session_profile_home_or_empty(s)
             _profile_runtime_env = {}
             _safe_profile_runtime_env = {}
             patch_skill_home_modules = None
@@ -15701,7 +15704,10 @@ def _run_agent_streaming(
             # injectionFrequency: "first-turn" actually suppresses after turn 1.
             _cache_new_agent = False
             if ephemeral:
-                agent = _AIAgent(**_agent_kwargs)
+                agent, _ = construct_profile_scoped_agent(
+                    _AIAgent, _agent_kwargs, profile_home=_profile_home,
+                    agent_params=_agent_params, session_id=session_id,
+                )
                 logger.debug('[webui] Created ephemeral agent for session %s', session_id)
             else:
                 from api.config import SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK
@@ -15811,8 +15817,11 @@ def _run_agent_streaming(
                     if hasattr(agent, '_interrupt_message'):
                         agent._interrupt_message = None
                 else:
-                    agent = _AIAgent(**_agent_kwargs)
-                    _cache_new_agent = True
+                    # #8517: memory bound to this session's profile, else not cached.
+                    agent, _cache_new_agent = construct_profile_scoped_agent(
+                        _AIAgent, _agent_kwargs, profile_home=_profile_home,
+                        agent_params=_agent_params, session_id=session_id,
+                    )
 
             if not _register_agent_if_current(agent, _agent_sig if _cache_new_agent else None):
                 with _agent_lock:
@@ -16653,7 +16662,10 @@ def _run_agent_streaming(
                                 _agent_kwargs['acp_args'] = _runtime_bundle['acp_args']
                             if 'credential_pool' in _agent_params:
                                 _agent_kwargs['credential_pool'] = _runtime_bundle['credential_pool']
-                            agent = _AIAgent(**_agent_kwargs)
+                            agent, _heal_cacheable = construct_profile_scoped_agent(
+                                _AIAgent, _agent_kwargs, profile_home=_profile_home,
+                                agent_params=_agent_params, session_id=session_id,
+                            )
                             _agent_sig = _compute_agent_cache_signature(
                                 resolved_model,
                                 resolved_api_key,
@@ -16671,7 +16683,7 @@ def _run_agent_streaming(
                                 profile_home=_profile_home,
                                 safe_profile_runtime_env=_safe_profile_runtime_env,
                             )
-                            if not _register_agent_if_current(agent, _agent_sig):
+                            if not _register_agent_if_current(agent, _agent_sig if _heal_cacheable else None):
                                 # Returned-error settlement already owns _agent_lock.
                                 _finalize_cancelled_turn(s, ephemeral=ephemeral, message='Task cancelled before start.', stream_id=stream_id)
                                 put('cancel', _cancel_event_payload('Cancelled by user'))
@@ -18135,7 +18147,10 @@ def _run_agent_streaming(
                         _heal_kwargs['acp_args'] = _runtime_bundle['acp_args']
                     if 'credential_pool' in _agent_params:
                         _heal_kwargs['credential_pool'] = _runtime_bundle['credential_pool']
-                    _heal_agent = _AIAgent(**_heal_kwargs)
+                    _heal_agent, _heal_cacheable = construct_profile_scoped_agent(
+                        _AIAgent, _heal_kwargs, profile_home=_profile_home,
+                        agent_params=_agent_params, session_id=session_id,
+                    )
                     # Delta callbacks close over `agent`; the replacement, not
                     # the failed original, owns any successful retry output.
                     agent = _heal_agent
@@ -18156,7 +18171,7 @@ def _run_agent_streaming(
                         profile_home=_profile_home,
                         safe_profile_runtime_env=_safe_profile_runtime_env,
                     )
-                    if not _register_agent_if_current(_heal_agent, _agent_sig):
+                    if not _register_agent_if_current(_heal_agent, _agent_sig if _heal_cacheable else None):
                         with _agent_lock:
                             _finalize_cancelled_turn(s, ephemeral=ephemeral, message='Task cancelled before start.', stream_id=stream_id)
                         put('cancel', _cancel_event_payload('Cancelled by user'))

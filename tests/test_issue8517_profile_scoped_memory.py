@@ -652,3 +652,195 @@ def test_installed_agent_bound_scope_contract():
     scope = mcs.bound_scope(str(REPO_ROOT), "alpha")
     assert scope["hermes_home"] == str(REPO_ROOT)
     assert scope["home_key"] == hc_real.hermes_home_key(str(REPO_ROOT))
+
+
+# ── construct_profile_scoped_agent: branch contract ──────────────────────────
+
+class _Recorder:
+    """Minimal agent class: records kwargs and the home it saw at construction."""
+
+    def __init__(self, manager_factory=None, *, accept_skip_memory=True, raise_on_init=False):
+        self.manager_factory = manager_factory
+        self.accept_skip_memory = accept_skip_memory
+        self.raise_on_init = raise_on_init
+        self.built = []
+
+    def cls(self):
+        rec = self
+
+        if rec.accept_skip_memory:
+            class _Agent:
+                def __init__(self, skip_memory=False, **kwargs):
+                    _init(self, dict(kwargs, skip_memory=skip_memory))
+        else:
+            class _Agent:  # an Agent build without the skip_memory parameter
+                def __init__(self, **kwargs):
+                    _init(self, dict(kwargs))
+
+        def _init(agent, kwargs):
+            agent.kwargs = kwargs
+            agent.seen_home = str(sys.modules["hermes_constants"].get_hermes_home())
+            agent._memory_manager = (
+                None if kwargs.get("skip_memory") or rec.manager_factory is None
+                else rec.manager_factory(agent.seen_home)
+            )
+            rec.built.append(agent)
+            if rec.raise_on_init:
+                raise RuntimeError("constructor failed (issue8517 test)")
+
+        return _Agent
+
+
+class _ShutdownTrackingProvider(SharedInstanceMemoryProvider):
+    def __init__(self, frozen_root):
+        super().__init__(frozen_root)
+        self.shutdowns = 0
+
+    def shutdown(self):
+        self.shutdowns += 1
+
+
+@pytest.fixture
+def scope_mod(monkeypatch):
+    import api.memory_profile_scope as mod
+    monkeypatch.setattr(mod, "_logged_once", set())
+    return mod
+
+
+def test_empty_profile_home_builds_without_memory(hc, homes, scope_mod, caplog):
+    rec = _Recorder(lambda home: FakeMemoryManager(object(), home, "x"))
+    kwargs = {"model": "m"}
+    caplog.set_level(logging.WARNING)
+
+    agent, cacheable = scope_mod.construct_profile_scoped_agent(
+        rec.cls(), kwargs, profile_home="", session_id="s-empty"
+    )
+
+    assert cacheable is False
+    assert agent._memory_manager is None and agent.kwargs["skip_memory"] is True
+    assert kwargs == {"model": "m"}, "caller kwargs must not be mutated"
+    assert _memory_warnings(caplog, "s-empty")
+
+
+def test_agent_without_skip_memory_parameter_is_detached_when_failing_closed(hc, homes, scope_mod):
+    rec = _Recorder(lambda home: FakeMemoryManager(object(), home, "x"), accept_skip_memory=False)
+
+    agent, cacheable = scope_mod.construct_profile_scoped_agent(
+        rec.cls(), {}, profile_home="", session_id="s-old"
+    )
+
+    assert cacheable is False
+    assert "skip_memory" not in agent.kwargs, "an unknown kwarg would raise TypeError on that Agent"
+    assert agent._memory_manager is None
+
+
+def test_mismatch_rebuilds_without_memory_and_never_shuts_down_the_shared_provider(
+    hc, homes, scope_mod, monkeypatch
+):
+    provider = _ShutdownTrackingProvider(homes["default"])
+    # The manager reports beta whatever the constructor saw.
+    rec = _Recorder(lambda _home: FakeMemoryManager(provider, homes["beta"], "beta"))
+
+    agent, cacheable = scope_mod.construct_profile_scoped_agent(
+        rec.cls(), {"model": "m"}, profile_home=str(homes["alpha"]), session_id="s-mm"
+    )
+
+    assert cacheable is False
+    assert len(rec.built) == 2
+    first, rebuilt = rec.built
+    assert first._memory_manager is None, "the mismatched manager must be detached"
+    assert agent is rebuilt and rebuilt.kwargs["skip_memory"] is True
+    assert rebuilt.seen_home == str(homes["alpha"]), "the rebuild runs inside the profile scope"
+    assert provider.shutdowns == 0, "a shared provider instance may still serve beta"
+
+
+def test_mismatch_on_agent_without_skip_memory_detaches_in_place(hc, homes, scope_mod):
+    rec = _Recorder(lambda _home: FakeMemoryManager(object(), homes["beta"], "beta"), accept_skip_memory=False)
+
+    agent, cacheable = scope_mod.construct_profile_scoped_agent(
+        rec.cls(), {}, profile_home=str(homes["alpha"]), session_id="s-mm-old"
+    )
+
+    assert cacheable is False and len(rec.built) == 1
+    assert agent._memory_manager is None
+
+
+def test_bound_scope_without_home_key_is_compared_by_home(hc, homes, scope_mod):
+    class _Mgr:
+        def __init__(self, home):
+            self._bound_scope = {"hermes_home": str(home), "agent_identity": "x"}
+
+    ok, ok_cacheable = scope_mod.construct_profile_scoped_agent(
+        _Recorder(lambda home: _Mgr(home)).cls(), {}, profile_home=str(homes["alpha"])
+    )
+    bad, bad_cacheable = scope_mod.construct_profile_scoped_agent(
+        _Recorder(lambda _home: _Mgr(homes["beta"])).cls(), {}, profile_home=str(homes["alpha"])
+    )
+
+    assert ok_cacheable is True and ok._memory_manager is not None
+    assert bad_cacheable is False and bad._memory_manager is None
+
+
+def test_manager_home_key_is_used_when_there_is_no_bound_scope(hc, homes, scope_mod):
+    class _Mgr:  # Agent 2026-10-12..16: MemoryManager._home_key, no _bound_scope
+        def __init__(self, home):
+            self._home_key = _key(home)
+
+    ok, ok_cacheable = scope_mod.construct_profile_scoped_agent(
+        _Recorder(lambda home: _Mgr(home)).cls(), {}, profile_home=str(homes["alpha"])
+    )
+    bad, bad_cacheable = scope_mod.construct_profile_scoped_agent(
+        _Recorder(lambda _home: _Mgr(homes["beta"])).cls(), {}, profile_home=str(homes["alpha"])
+    )
+
+    assert ok_cacheable is True and ok._memory_manager is not None
+    assert bad_cacheable is False and bad._memory_manager is None
+
+
+def test_unverifiable_binding_keeps_memory_and_logs_once(hc, homes, scope_mod, caplog):
+    from unittest.mock import MagicMock
+
+    class _Mgr:  # nothing to read back (Agent before 2026-10-12)
+        providers = []
+
+    caplog.set_level(logging.WARNING)
+    for factory in (lambda home: _Mgr(), lambda home: MagicMock()):
+        agent, cacheable = scope_mod.construct_profile_scoped_agent(
+            _Recorder(factory).cls(), {}, profile_home=str(homes["alpha"])
+        )
+        assert cacheable is True and agent._memory_manager is not None
+    assert len([r for r in caplog.records if "does not report" in r.getMessage()]) == 1
+
+
+def test_override_that_does_not_take_effect_fails_closed(hc, homes, scope_mod, monkeypatch):
+    monkeypatch.setattr(hc, "get_hermes_home", lambda: Path(homes["beta"]))
+    rec = _Recorder(lambda home: FakeMemoryManager(object(), home, "x"))
+
+    agent, cacheable = scope_mod.construct_profile_scoped_agent(
+        rec.cls(), {}, profile_home=str(homes["alpha"]), session_id="s-noeffect"
+    )
+
+    assert cacheable is False and agent._memory_manager is None
+
+
+def test_override_is_restored_even_when_the_constructor_raises(hc, homes, scope_mod):
+    before = hc.get_hermes_home_override()
+    rec = _Recorder(lambda home: FakeMemoryManager(object(), home, "x"), raise_on_init=True)
+
+    with pytest.raises(RuntimeError, match="constructor failed"):
+        scope_mod.construct_profile_scoped_agent(rec.cls(), {}, profile_home=str(homes["alpha"]))
+
+    assert rec.built[0].seen_home == str(homes["alpha"])
+    assert hc.get_hermes_home_override() == before
+
+
+def test_profile_home_override_is_set_for_construction_only(hc, homes, scope_mod):
+    before = hc.get_hermes_home_override()
+    rec = _Recorder(lambda home: FakeMemoryManager(object(), home, "alpha"))
+
+    agent, cacheable = scope_mod.construct_profile_scoped_agent(
+        rec.cls(), {}, profile_home=str(homes["alpha"])
+    )
+
+    assert cacheable is True and agent.seen_home == str(homes["alpha"])
+    assert hc.get_hermes_home_override() == before

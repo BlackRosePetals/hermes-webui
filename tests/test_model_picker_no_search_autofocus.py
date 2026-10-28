@@ -1,16 +1,18 @@
-"""Opening the model picker must not auto-focus the search input.
+"""Opening the model picker must focus the right thing for the device.
 
-Why: the picker is a CHOOSER. Users open it to pick a model, not to search. On
-phones the auto-focus pops the on-screen keyboard the instant the chip is
-tapped, so the model list sits behind the IME and the user has to dismiss the
-keyboard before they can tap a row. Upstream suppressed this for the Settings
-picker on coarse pointers only; the local policy is uniform: NO device
-auto-focuses.
+Why: the picker is a CHOOSER. On a phone, grabbing the search box pops the
+on-screen keyboard the instant the chip is tapped, so the model list sits behind
+the IME. On a desktop, the opposite is true (#8530): a user expects to type the
+model name immediately, and IME input needs a real text field to compose into.
 
-What replaces it: the dropdown container receives focus, so arrow-key /
-Enter / Escape navigation still works without any text field being focused
-(and therefore without any IME). Focus is still restored for a user who is
-already typing in the search box when a re-render happens.
+One rule, both pickers (_modelPickerFocusTarget):
+  * device with a keyboard in play (desktop / tablet + hardware keyboard) ->
+    the search input takes focus AFTER the dropdown is open and positioned;
+  * touch-only device -> the dropdown container takes focus, so no IME appears.
+
+The container is still a real focus target, and a printable character typed
+while it holds focus is redirected into the search box instead of reaching the
+global j/k session switcher (which would change the chat behind the open menu).
 """
 
 from __future__ import annotations
@@ -20,6 +22,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 UI_JS = (REPO / "static" / "ui.js").read_text(encoding="utf-8")
+BOOT_JS = (REPO / "static" / "boot.js").read_text(encoding="utf-8")
+STYLE_CSS = (REPO / "static" / "style.css").read_text(encoding="utf-8")
 
 
 def _function_body(src: str, name: str) -> str:
@@ -44,9 +48,10 @@ def test_renderer_never_auto_focuses_the_search_input():
     # call site can re-enable the keyboard pop by passing an option.
     assert "const _autoFocusSearch=false;" in body
     assert "opts.autoFocusSearch" not in body
-    # The one surviving focus call is the typing-preservation path, not a
-    # first-open autofocus.
-    assert "if(_autoFocusSearch||_hadFocus) _si.focus();" in body
+    # The one surviving focus call hands focus to the NEW input after a rebuild
+    # (the pre-render node is detached); it is not a first-open autofocus.
+    assert "if(_autoFocusSearch||_hadFocus||_searchHadFocusBefore){" in body
+    assert "_siNow.focus()" in body
 
 
 def test_no_call_site_passes_the_autofocus_option():
@@ -56,27 +61,65 @@ def test_no_call_site_passes_the_autofocus_option():
     assert "autoFocusSearch!==false" not in UI_JS
 
 
-def test_dropdown_container_is_focusable_and_receives_focus():
+def test_focus_target_depends_on_the_device_not_the_call_site():
+    helper = _function_body(UI_JS, "_modelPickerFocusTarget")
+    prefers = _function_body(UI_JS, "_modelPickerPrefersSearchFocus")
+    # boot.js owns device detection (#3076): reuse it instead of a second
+    # coarse-pointer sniff inside the picker.
+    assert "_isTouchOnlyDevice" in prefers
+    assert "matchMedia" not in prefers
+    assert "querySelector('.model-search-input')" in helper
+    # Touch-only falls back to the container, which stays focusable.
+    assert "return (typeof dd.focus==='function')?dd:null;" in helper
+    # Both open paths go through the helper, AFTER the dropdown is shown —
+    # focusing a display:none node is a no-op (the #8530 report).
+    toggle = _function_body(UI_JS, "toggleModelDropdown")
+    assert "_focusModelPicker(dd);" in toggle
+    assert toggle.index("dd.classList.add('open');") < toggle.index("_focusModelPicker(dd);")
+    assert toggle.index("_positionModelDropdown();") < toggle.index("_focusModelPicker(dd);")
+    settings = _function_body(UI_JS, "openSettingsModelDropdown")
+    assert "_focusModelPicker(dd)" in settings
+    assert settings.index("dd.classList.add('open');") < settings.index("_focusModelPicker(dd)")
+
+
+def test_dropdown_container_is_focusable_and_labelled():
     body = _function_body(UI_JS, "renderModelDropdown")
     # A plain <div> is not focusable — focus() on it is a silent no-op, which
-    # would leave arrow-key navigation dead once the search box stops grabbing
-    # focus. tabindex="-1" makes it programmatically focusable only.
+    # would leave arrow-key navigation dead on touch-only devices.
     assert "dd.setAttribute('tabindex','-1')" in body
-
-    open_body = _function_body(UI_JS, "toggleModelDropdown")
-    assert "dd.focus({preventScroll:true})" in open_body
-    # Focus must land AFTER the phone path reparents the menu onto <body>
-    # (_positionModelDropdown), or the reparent detaches the focused node.
-    assert open_body.index("_positionModelDropdown();") < open_body.index("dd.focus({preventScroll:true})")
-    # And it must never target the search input on open.
-    assert "querySelector('.model-search-input')" not in open_body
-    assert ".model-search-input').focus" not in open_body
+    # And a focused node with no name makes a screen reader announce nothing.
+    assert "dd.setAttribute('role','group')" in body
+    assert "dd.setAttribute('aria-label',_pickerLabel)" in body
+    assert "const _pickerLabel=opts.label||'Model picker';" in body
+    # The announced name is the picker's EXISTING label, not an invented string.
+    assert "renderModelDropdown({label:'Conversation model'})" in UI_JS
+    assert "label:t('settings_label_model')" in UI_JS
 
 
-def test_settings_picker_also_focuses_container_not_input():
-    body = _function_body(UI_JS, "openSettingsModelDropdown")
-    assert "querySelector('.model-search-input')" not in body
-    assert "dd.focus({preventScroll:true})" in body
+def test_container_focus_ring_is_deliberately_suppressed():
+    # Decided on purpose: the highlighted row already shows the keyboard
+    # position, so Chromium's default ring around the whole menu is noise.
+    assert ".model-dropdown:focus-visible{outline:none;}" in STYLE_CSS
+
+
+def test_model_dropdown_is_treated_as_an_interactive_swipe_target():
+    # The global j/k session switcher and the PWA sidebar gesture both consult
+    # this predicate; without .model-dropdown a key/swipe inside the open menu
+    # acts on the page behind it.
+    body = _function_body(BOOT_JS, "_isInteractiveSwipeTarget")
+    assert ".model-dropdown" in body
+    assert ".img-lightbox" in body  # pre-existing selector must survive
+
+
+def test_printable_key_on_the_container_is_redirected_into_search():
+    body = _function_body(UI_JS, "renderModelDropdown")
+    assert "if(e.target!==dd) return;" in body
+    # Printable only: navigation keys and shortcuts keep their behaviour.
+    assert "e.key.length===1" in body
+    assert "!e.ctrlKey&&!e.metaKey&&!e.altKey" in body
+    assert "e.preventDefault();" in body
+    assert "e.stopPropagation()" in body
+    assert "si.dispatchEvent(new Event('input',{bubbles:true}))" in body
 
 
 def test_keyboard_navigation_survives_container_focus():
@@ -199,6 +242,21 @@ function makeListenerList() {
 }
 
 let _activeElement = null;
+// Device rule under test: boot.js owns it in production, and the picker must not
+// grow a second sniffer. Flipped per phase below.
+let __touchOnly = true;
+
+function _isTouchOnlyDevice() { return __touchOnly; }
+
+function detachTree(node) {
+  node._attached = false;
+  for (const child of node.children || []) detachTree(child);
+}
+
+function attachTree(node, attached) {
+  node._attached = attached;
+  for (const child of node.children || []) attachTree(child, attached);
+}
 
 function _matchesClass(el, sel) {
   if (!sel || sel[0] !== '.') return false;
@@ -215,6 +273,7 @@ function makeNode(tag) {
     // harness would "succeed" at focusing an unfocusable container and hide a
     // missing tabindex="-1".
     _focusable: ['INPUT', 'BUTTON', 'SELECT', 'TEXTAREA', 'A'].includes(_tag),
+    _attached: false,
     children: [],
     parentElement: null,
     style: {},
@@ -226,6 +285,9 @@ function makeNode(tag) {
     _innerHTML: '',
     appendChild(child) {
       child.parentElement = this;
+      // Attach the whole subtree: a child of an in-document node is in document
+      // too, which is exactly the browser rule the focus() guard relies on.
+      attachTree(child, !!this._attached);
       this.children.push(child);
       return child;
     },
@@ -233,10 +295,19 @@ function makeNode(tag) {
       if (!this._listeners[type]) this._listeners[type] = makeListenerList();
       this._listeners[type].list.push(handler);
     },
-    dispatchEvent(type, event) {
+    dispatchEvent(typeOrEvent, maybeEvent) {
+      // Browser-shaped dispatch: either (type, event), as the older driver code
+      // calls it, or a single Event object whose .type names the listeners — the
+      // production code dispatches `new Event('input',{bubbles:true})` and a
+      // harness that only understood (type, event) would silently swallow it.
+      let type;
+      let event;
+      if (typeof typeOrEvent === 'string') { type = typeOrEvent; event = maybeEvent || {}; }
+      else if (typeOrEvent && typeof typeOrEvent === 'object') { type = typeOrEvent.type; event = typeOrEvent; }
+      if (!type) return;
       const ll = this._listeners[type];
       if (!ll) return;
-      for (const fn of ll.list) fn(event || {});
+      for (const fn of ll.list) fn(event);
     },
     _walk(pred, out) {
       for (const c of this.children || []) {
@@ -260,8 +331,12 @@ function makeNode(tag) {
     },
     setAttribute(name, value) { if (name === 'tabindex') this._focusable = true; this[name] = value; },
     hasAttribute(name) { return this[name] !== undefined && this[name] !== null; },
+    getAttribute(name) { return this.hasAttribute(name) ? String(this[name]) : null; },
     removeAttribute(name) { if (name === 'tabindex') this._focusable = false; delete this[name]; },
-    focus() { if (!this._focusable) return; this._focused = true; _activeElement = this; },
+    // Detachment matters: a full re-render replaces the input node, and a browser
+    // ignores focus() on a node that is no longer in the document. Without this
+    // the harness would keep "focusing" the stale node and hide the bug.
+    focus() { if (!this._focusable || !this._attached) return; this._focused = true; _activeElement = this; },
     blur() { this._focused = false; if (_activeElement === this) _activeElement = null; },
     click() {
       const event = { stopPropagation() {}, preventDefault() {} };
@@ -277,6 +352,9 @@ function makeNode(tag) {
     set(v) {
       const html = String(v || '');
       this._innerHTML = html;
+      // Children built as HTML strings are replaced wholesale: detach the old
+      // subtree so focus() on a stale node behaves like a browser (no-op).
+      for (const child of this.children) detachTree(child);
       this.children = [];
       // The renderer builds subtrees as HTML STRINGS (search row, custom row)
       // and then queries inside them. Recreate the known element stubs from
@@ -320,6 +398,11 @@ function makeSelect(groups, selectedValue) {
 const dropdown = makeNode('div');
 const chip = makeNode('button');
 const mobileAction = makeNode('div');
+// Attach the roots: everything appended under them counts as in-document, so a
+// node replaced by a re-render is the only thing that becomes unfocusable.
+dropdown._attached = true;
+chip._attached = true;
+mobileAction._attached = true;
 const modelSelect = makeSelect(payload.groups, payload.selectedValue);
 
 function $(id) {
@@ -372,6 +455,9 @@ for (const name of [
   '_readModelOverflowData',
   '_appendOverflowOptionsToGroup',
   '_isEquivalentConfiguredModelEntry',
+  '_modelPickerPrefersSearchFocus',
+  '_modelPickerFocusTarget',
+  '_focusModelPicker',
   'renderModelDropdown',
   'toggleModelDropdown',
 ]) {
@@ -380,32 +466,71 @@ for (const name of [
 
 (async () => {
   const out = {};
-  // --- initial open focuses the container, never the search input ---------
+
+  // ===== touch-only device: open focuses the CONTAINER ====================
+  // A phone must not raise the IME over the list, so the container takes focus
+  // (no text field focused => no software keyboard).
+  __touchOnly = true;
   await toggleModelDropdown();
   out.dropdownHasOpenClass = dropdown.classList.contains('open');
   out.dropdownHasTabindex = dropdown.hasAttribute('tabindex');
+  out.dropdownRole = dropdown.getAttribute('role');
+  out.dropdownAriaLabel = dropdown.getAttribute('aria-label');
   out.openActiveIsDropdown = document.activeElement === dropdown;
   out.openActiveIsSearchInput = !!(
     document.activeElement && document.activeElement.classList.contains('model-search-input')
   );
 
-  // --- explicit search intent focuses the input, survives a re-render -----
+  // ===== printable key on the container goes to the search box ============
+  // This is the regression: the key used to bubble to the global j/k session
+  // switcher, changing the chat behind the open menu, while the filter stayed
+  // empty.
+  let keyDownPrevented = false;
+  let keyDownStopped = false;
+  dropdown.dispatchEvent('keydown', {
+    key: 'k', target: dropdown,
+    preventDefault() { keyDownPrevented = true; },
+    stopPropagation() { keyDownStopped = true; },
+  });
+  const siAfterKey = dropdown.querySelector('.model-search-input');
+  out.printableKeyPrevented = keyDownPrevented;
+  out.printableKeyStopped = keyDownStopped;
+  out.printableKeyActiveIsSearchInput = document.activeElement === siAfterKey;
+  out.printableKeyLandedInValue = !!siAfterKey && siAfterKey.value === 'k';
+  // The dispatched `input` event must run the REAL filter — 'k' matches nothing
+  // in this payload, so every row disappears.
+  out.printableKeyFilteredRows = dropdown.querySelectorAll('.model-opt').length === 0;
+
+  // clear the term so the navigation checks below have rows again
+  siAfterKey.value = '';
+  siAfterKey.dispatchEvent(new Event('input', { bubbles: true }));
+  out.clearRestoredRows = dropdown.querySelectorAll('.model-opt').length >= 4;
+
+  // ===== desktop: reopen focuses the SEARCH input =========================
+  // Type immediately (#8530), and IME composition has a real text field.
+  __touchOnly = false;
+  siAfterKey.dispatchEvent('keydown', {
+    key: 'Escape', target: siAfterKey, preventDefault() {}, stopPropagation() {},
+  });
+  out.escapeFromInputCloses = !dropdown.classList.contains('open');
+  await toggleModelDropdown();
   const si = dropdown.querySelector('.model-search-input');
   out.searchInputExists = !!si;
+  out.desktopOpenActiveIsSearchInput = document.activeElement === si;
+
+  // ===== explicit search intent survives a re-render ======================
   si.focus();
   out.manualFocusActiveIsSearchInput = document.activeElement === si;
-  renderModelDropdown(); // background re-render (late fetch / prefs refresh)
+  renderModelDropdown(); // top-level re-render (late fetch / prefs refresh)
   const si2 = dropdown.querySelector('.model-search-input');
-  out.rerenderActiveIsSearchInput = document.activeElement === si2;
   out.rerenderReplacedInputNode = !!si2 && si2 !== si;
+  out.rerenderActiveIsSearchInput = document.activeElement === si2;
+
+  // ===== repeated renders do not duplicate keyboard handling ==============
   dropdown.focus();
+  renderModelDropdown();
   renderModelDropdown();
   out.rerenderKeepsContainerFocus = document.activeElement === dropdown;
-
-  // --- repeated renders do not duplicate keyboard handling ---------------
-  dropdown.focus();
-  renderModelDropdown();
-  renderModelDropdown();
   const keydownLL = dropdown._listeners['keydown'];
   out.keydownListenerCount = keydownLL ? keydownLL.list.length : 0;
   const rows = dropdown.querySelectorAll('.model-opt');
@@ -443,9 +568,18 @@ for (const name of [
   });
   out.escapeClosesDropdown = !dropdown.classList.contains('open');
 
-  // --- close / reopen still focuses the container -------------------------
+  // ===== close / reopen follows the device rule again =====================
+  __touchOnly = false;
   await toggleModelDropdown();
-  out.reopenActiveIsDropdown = document.activeElement === dropdown;
+  out.reopenDesktopActiveIsSearchInput = (
+    document.activeElement === dropdown.querySelector('.model-search-input')
+  );
+  dropdown.dispatchEvent('keydown', {
+    key: 'Escape', target: dropdown, preventDefault() {}, stopPropagation() {},
+  });
+  __touchOnly = true;
+  await toggleModelDropdown();
+  out.reopenTouchActiveIsContainer = document.activeElement === dropdown;
 
   process.stdout.write(JSON.stringify(out));
 })().catch((e) => { process.stderr.write(String(e && e.stack || e)); process.exit(1); });
@@ -492,14 +626,48 @@ def _focus_driver_out(tmp_path_factory):
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
-def test_open_focuses_the_container_not_the_search_input(_focus_driver_out):
+def test_touch_only_open_focuses_the_container_not_the_search_input(_focus_driver_out):
     out = _focus_driver_out
     assert out["dropdownHasOpenClass"], "open path did not run"
     assert out["dropdownHasTabindex"], (
         "container must stay programmatically focusable (tabindex=-1); without it focus() is a no-op"
     )
-    assert out["openActiveIsDropdown"], "initial open must focus the dropdown container"
-    assert not out["openActiveIsSearchInput"], "initial open must NOT focus the search input (IME pop)"
+    assert out["openActiveIsDropdown"], "touch-only open must focus the dropdown container"
+    assert not out["openActiveIsSearchInput"], "touch-only open must NOT focus the search input (IME pop)"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_container_is_announced_by_a_screen_reader(_focus_driver_out):
+    out = _focus_driver_out
+    assert out["dropdownRole"] == "group", "the focus target needs a role, or a screen reader says nothing"
+    assert out["dropdownAriaLabel"] == "Conversation model", (
+        "the announced name must be the picker's existing label, not an invented string"
+    )
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_printable_key_on_container_lands_in_search_and_is_not_a_shortcut(_focus_driver_out):
+    out = _focus_driver_out
+    # The regression: a printable key bubbled to the global j/k session switcher
+    # and changed the conversation behind the open menu.
+    assert out["printableKeyPrevented"], "a printable key on the container must preventDefault()"
+    assert out["printableKeyStopped"], (
+        "it must stopPropagation() too — otherwise sessions.js still runs the j/k handler"
+    )
+    assert out["printableKeyActiveIsSearchInput"], "focus must move into the search box"
+    assert out["printableKeyLandedInValue"], "the character must be inserted into the search value"
+    assert out["printableKeyFilteredRows"], "the dispatched input event must run the real filter"
+    assert out["clearRestoredRows"], "clearing the query must restore the rows (harness sanity)"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_desktop_open_focuses_the_search_input(_focus_driver_out):
+    out = _focus_driver_out
+    assert out["escapeFromInputCloses"], "Escape from the input must close the picker"
+    assert out["desktopOpenActiveIsSearchInput"], (
+        "on a device with a keyboard the search box must take focus so the first "
+        "character (and IME input) works immediately (#8530)"
+    )
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
@@ -510,7 +678,8 @@ def test_explicit_search_intent_focuses_the_input(_focus_driver_out):
         "explicit focus() on the search input must land on the input — a user who wants to search still can"
     )
     # A background re-render replaces the input node; focus must follow to the
-    # NEW node or a user mid-word gets silently dropped to <body>.
+    # NEW node or a user mid-word gets silently dropped to <body>. The harness
+    # refuses focus() on a detached node, so focusing the stale one cannot pass.
     assert out["rerenderReplacedInputNode"], "harness sanity: the re-render really replaced the input node"
     assert out["rerenderActiveIsSearchInput"], "re-render must preserve search-input focus (typing user)"
     assert out["rerenderKeepsContainerFocus"], "re-render must preserve container focus (arrow-key user)"
@@ -537,6 +706,11 @@ def test_repeated_renders_do_not_duplicate_keyboard_handling(_focus_driver_out):
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
-def test_close_and_reopen_still_focuses_the_container(_focus_driver_out):
+def test_close_and_reopen_follows_the_device_rule(_focus_driver_out):
     out = _focus_driver_out
-    assert out["reopenActiveIsDropdown"], "reopening after close must focus the container again"
+    assert out["reopenDesktopActiveIsSearchInput"], (
+        "reopening on a device with a keyboard must focus the search box again"
+    )
+    assert out["reopenTouchActiveIsContainer"], (
+        "reopening on a touch-only device must focus the container again (no IME)"
+    )

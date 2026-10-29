@@ -259,7 +259,9 @@ def test_eviction_commit_from_another_profiles_turn_runs_as_owner(hc, homes, lif
     log: list = []
     sid = "issue8517-boundary-alpha"
     alpha_agent = OwnerCheckedAgent(homes["alpha"], log)
-    lifecycle.mark_turn_completed(sid, agent=alpha_agent)
+    # The streaming path records the owner beside every turn mark (all-r2 finding 3:
+    # ownership is never derived from the agent's own binding).
+    lifecycle.mark_turn_completed(sid, agent=alpha_agent, profile_home=str(homes["alpha"]))
 
     # beta's turn (its own override installed) evicts alpha's cached agent.
     token = hc.set_hermes_home_override(str(homes["beta"]))
@@ -283,7 +285,7 @@ def test_refused_commit_is_not_counted_and_stays_retryable(hc, homes, lifecycle,
     refuse = {"on": True}
     sid = "issue8517-refused-alpha"
     alpha_agent = OwnerCheckedAgent(homes["alpha"], log, always_refuse=refuse)
-    lifecycle.mark_turn_completed(sid, agent=alpha_agent)
+    lifecycle.mark_turn_completed(sid, agent=alpha_agent, profile_home=str(homes["alpha"]))
 
     with caplog.at_level(logging.WARNING):
         assert lifecycle.commit_session_memory(sid, wait=True) is False
@@ -308,8 +310,8 @@ def test_previous_session_thread_and_shutdown_drain_commit_as_owner(hc, homes, l
     sid_a, sid_b = "issue8517-prev-alpha", "issue8517-drain-alpha"
     agent_a = OwnerCheckedAgent(homes["alpha"], log)
     agent_b = OwnerCheckedAgent(homes["alpha"], log)
-    lifecycle.mark_turn_completed(sid_a, agent=agent_a)
-    lifecycle.mark_turn_completed(sid_b, agent=agent_b)
+    lifecycle.mark_turn_completed(sid_a, agent=agent_a, profile_home=str(homes["alpha"]))
+    lifecycle.mark_turn_completed(sid_b, agent=agent_b, profile_home=str(homes["alpha"]))
     monkeypatch.setenv("HERMES_HOME", str(homes["beta"]))
 
     result = {}

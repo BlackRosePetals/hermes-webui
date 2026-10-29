@@ -489,17 +489,6 @@ def profile_home_turn_scope(profile_home: str):
 _CALLER_SCOPE_LOGGER = "agent.memory_caller_scope"
 
 
-def agent_bound_memory_home(agent: Any) -> str:
-    """The home the agent's memory manager says it was initialised for, or ``""``."""
-    manager = getattr(agent, "_memory_manager", None)
-    scope = getattr(manager, "_bound_scope", None) if manager is not None else None
-    if isinstance(scope, dict):
-        home = scope.get("hermes_home")
-        if isinstance(home, str) and home.strip():
-            return home
-    return ""
-
-
 def session_owner_profile_home(session_id: str) -> str:
     """The profile home of the session ``session_id`` belongs to, looked up from the
     session store; ``""`` when the session or its profile cannot be resolved."""
@@ -544,28 +533,22 @@ def _enter_session_owner_scope(agent: Any, session_id: str, owner_home: str) -> 
     hook on ``agent``. ``(restore, reason)``: ``reason`` set means do not run it."""
     if getattr(agent, "_memory_manager", None) is None:
         return _noop, None  # no external memory: nothing to bind, nothing to refuse
-    bound_home = agent_bound_memory_home(agent)
-    owner = str(owner_home or "").strip() or session_owner_profile_home(session_id) or bound_home
-    if not owner:
-        # Agent from before _bound_scope (2026-10-17) and no resolvable session:
-        # it has no caller-scope check either, so the hook runs as before.
-        _log_once(
-            "owner-unknown",
-            "[webui] #8517: cannot tell which profile owns a session-boundary memory "
-            "commit (Agent without a bound scope); running it unscoped.",
+    # Trusted ownership only: the owner recorded beside the turn mark, else the
+    # session store. Never the agent's own binding (a misbound agent would vouch
+    # for itself) and never unscoped (#8517 all-r2 finding 3).
+    owner = str(owner_home or "").strip() or session_owner_profile_home(session_id)
+    owner_key = profile_home_key(owner) if owner else None
+    if not owner_key:
+        return _noop, (
+            "the profile that owns the session could not be resolved (no recorded owner "
+            "and no session record)"
         )
-        return _noop, None
-    owner_key = profile_home_key(owner)
     state, bound_key = _bound_memory_home_key(agent)
     if state == "bound" and bound_key != owner_key:
         return _noop, (
             f"its memory provider is bound to {bound_key!r}, not the session's profile home {owner_key!r}"
         )
-    mod = _hermes_constants()
-    if not callable(getattr(mod, "set_hermes_home_override", None)):
-        # Hermes Agent < v0.18.0: no context-local home and no caller-scope check;
-        # the provider commits where it was bound at construction.
-        return _noop, None
+    # On an Agent < v0.18.0 this refuses too (no context-local home to hold).
     return _enter_profile_home(owner, owner_key)
 
 

@@ -16683,7 +16683,9 @@ def _run_agent_streaming(
                                 profile_home=_profile_home,
                                 safe_profile_runtime_env=_safe_profile_runtime_env,
                             )
-                            if not _register_agent_if_current(agent, _agent_sig if _heal_cacheable else None):
+                            if not _heal_cacheable:
+                                _agent_sig = None  # #8517: memory scope failed; never cache it
+                            if not _register_agent_if_current(agent, _agent_sig):
                                 # Returned-error settlement already owns _agent_lock.
                                 _finalize_cancelled_turn(s, ephemeral=ephemeral, message='Task cancelled before start.', stream_id=stream_id)
                                 put('cancel', _cancel_event_payload('Cancelled by user'))
@@ -18171,7 +18173,9 @@ def _run_agent_streaming(
                         profile_home=_profile_home,
                         safe_profile_runtime_env=_safe_profile_runtime_env,
                     )
-                    if not _register_agent_if_current(_heal_agent, _agent_sig if _heal_cacheable else None):
+                    if not _heal_cacheable:
+                        _agent_sig = None  # #8517: memory scope failed; never cache it
+                    if not _register_agent_if_current(_heal_agent, _agent_sig):
                         with _agent_lock:
                             _finalize_cancelled_turn(s, ephemeral=ephemeral, message='Task cancelled before start.', stream_id=stream_id)
                         put('cancel', _cancel_event_payload('Cancelled by user'))

@@ -180,7 +180,18 @@ def test_helper_require_parameters_defaults_false():
 # ── Streaming construction-site wiring (AST) ───────────────────────────────
 
 def _is_streaming_construction(call: ast.Call) -> bool:
-    """True for ``_AIAgent(**_agent_kwargs)``."""
+    """True for ``_AIAgent(**_agent_kwargs)`` and for its #8517 profile-scoped
+    form ``construct_profile_scoped_agent(_AIAgent, _agent_kwargs, ...)``."""
+    if (
+        isinstance(call.func, ast.Name)
+        and call.func.id == "construct_profile_scoped_agent"
+        and len(call.args) >= 2
+        and isinstance(call.args[0], ast.Name)
+        and call.args[0].id == "_AIAgent"
+        and isinstance(call.args[1], ast.Name)
+        and call.args[1].id == "_agent_kwargs"
+    ):
+        return True
     if not (isinstance(call.func, ast.Name) and call.func.id == "_AIAgent"):
         return False
     return (

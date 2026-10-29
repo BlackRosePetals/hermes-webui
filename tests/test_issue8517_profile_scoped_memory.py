@@ -107,11 +107,34 @@ def _key(path) -> str:
     return os.path.normcase(str(Path(str(path)).expanduser().resolve(strict=False)))
 
 
+def _ensure_claim_seam(monkeypatch) -> None:
+    """A current Agent (2026-10-17+) has ``agent.memory_manager.claim_instance``, the
+    seam the WebUI shared-instance guard wraps. Without any Agent (the agent-free CI)
+    the guard cannot install and the no-claim policy turns external memory off, so
+    give the ``hc`` tests a twin of that seam. The test agents never call it; only
+    the guard wraps it. Tests of Agents WITHOUT the seam replace it again."""
+    try:
+        import agent.memory_manager as real_mm  # noqa: PLC0415
+    except Exception:
+        real_mm = None
+    if real_mm is not None and callable(getattr(real_mm, "claim_instance", None)):
+        return
+    twin = types.ModuleType("agent.memory_manager")
+
+    def claim_instance(provider, home):
+        return True
+
+    twin.claim_instance = claim_instance
+    monkeypatch.setitem(sys.modules, "agent.memory_manager", twin)
+
+
 @pytest.fixture
 def hc(monkeypatch):
-    """hermes_constants with the context-local override API (real if installed)."""
+    """A current Agent's seams: hermes_constants with the context-local override API
+    and ``agent.memory_manager.claim_instance`` (the real ones if installed)."""
     monkeypatch.setattr(streaming, "_streaming_hermes_home_override_available", None)
     monkeypatch.setattr(profiles_api, "_hermes_home_override_available", None)
+    _ensure_claim_seam(monkeypatch)
     try:
         import hermes_constants as real  # noqa: PLC0415
     except Exception:
@@ -434,6 +457,14 @@ def run_turn(monkeypatch, homes):
             config_mod.SESSION_AGENT_CACHE.pop(sid, None)
 
 
+def assert_cached_memoryless(cached, agent):
+    """Agent < v0.18.0: memory is off for the life of the process, so the memoryless
+    agent is cached exactly as before #8517 (no later turn could build it with memory)."""
+    assert cached is agent, "a memoryless agent on an Agent < v0.18.0 stays cacheable"
+    assert getattr(cached, "_memory_manager", None) is None
+    assert getattr(cached, "_memory_store", None) is None
+
+
 def _cached_agent(session_id):
     with config_mod.SESSION_AGENT_CACHE_LOCK:
         entry = config_mod.SESSION_AGENT_CACHE.get(session_id)
@@ -618,7 +649,7 @@ def test_pre_override_agent_single_profile_runs_without_memory(legacy_hc, homes,
     turn = agent_cls.turns[0]
     assert turn["agent"]._memory_manager is None
     assert provider.inits == []
-    assert turn["cached_agent"] is None
+    assert_cached_memoryless(turn["cached_agent"], turn["agent"])
 
 
 def test_pre_override_agent_with_env_mirror_on_another_profile_fails_closed(
@@ -635,7 +666,7 @@ def test_pre_override_agent_with_env_mirror_on_another_profile_fails_closed(
     _assert_never_bound_to(homes["alpha"], agent_cls, provider, homes["beta"])
     turn = agent_cls.turns[0]
     assert turn["agent"]._memory_manager is None
-    assert turn["cached_agent"] is None
+    assert_cached_memoryless(turn["cached_agent"], turn["agent"])
 
 
 # ── every streaming construction site goes through the scoped constructor ────
@@ -849,3 +880,32 @@ def test_profile_home_override_is_set_for_construction_only(hc, homes, scope_mod
 
     assert cacheable is True and agent.seen_home == str(homes["alpha"])
     assert hc.get_hermes_home_override() == before
+
+
+def test_legacy_agent_memoryless_build_stays_cacheable(legacy_hc, homes, scope_mod, caplog):
+    """Agent < v0.18.0: memory is off (approved policy), and that is true for the
+    life of the process, so the memoryless agent is cacheable like before #8517.
+    Not caching it bought nothing and rebuilt the agent on every turn."""
+    caplog.set_level(logging.WARNING)
+    rec = _Recorder(lambda home: FakeMemoryManager(object(), home, "alpha"))
+
+    agent, cacheable = scope_mod.construct_profile_scoped_agent(
+        rec.cls(), {}, profile_home=str(homes["alpha"]), session_id="s-legacy"
+    )
+
+    assert cacheable is True
+    assert agent._memory_manager is None and getattr(agent, "_memory_store", None) is None
+    assert any("older than v0.18.0" in r.getMessage() for r in _memory_warnings(caplog, "s-legacy"))
+
+
+def test_turn_scope_failure_build_is_still_not_cacheable(hc, homes, scope_mod):
+    """A current Agent whose TURN could not hold its profile home: memory is off for
+    this turn only, so the agent is not cached and the next turn retries with memory."""
+    rec = _Recorder(lambda home: FakeMemoryManager(object(), home, "alpha"))
+
+    agent, cacheable = scope_mod.construct_profile_scoped_agent(
+        rec.cls(), {}, profile_home=str(homes["alpha"]), session_id="s-transient",
+        fail_closed_reason="the turn-level profile home override could not be set",
+    )
+
+    assert cacheable is False and agent._memory_manager is None

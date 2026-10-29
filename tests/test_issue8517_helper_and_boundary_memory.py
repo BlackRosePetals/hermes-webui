@@ -16,6 +16,7 @@ OWNER, and a commit the Agent refuses must stay pending instead of being counted
 
 Fixtures and stand-ins are reused from tests/test_issue8517_profile_scoped_memory.py.
 """
+# ruff: noqa: F811  (pytest fixtures imported from the #8517 P0/P1 module)
 from __future__ import annotations
 
 import ast

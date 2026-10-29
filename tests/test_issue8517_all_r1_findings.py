@@ -35,6 +35,7 @@ from tests.test_issue8517_profile_scoped_memory import (  # noqa: F401  (fixture
     SharedInstanceMemoryProvider,
     _cached_agent,
     _key,
+    assert_cached_memoryless,
     bank_rows,
     hc,
     homes,
@@ -357,7 +358,7 @@ def test_legacy_agent_multi_profile_never_admits_memory_on_an_env_snapshot(
     assert not bank_rows(homes["beta"]), f"alpha wrote into beta's bank: {bank_rows(homes['beta'])}"
     assert provider.inits == []
     assert cls.turns[0]["agent"]._memory_manager is None
-    assert _cached_agent(session_id) is None
+    assert_cached_memoryless(_cached_agent(session_id), cls.turns[0]["agent"])
     assert _warnings(caplog, "older than v0.18.0")
 
 
@@ -371,7 +372,7 @@ def test_legacy_agent_root_only_install_builds_without_memory(legacy_hc, homes, 
     session_id, _events = run_turn(profile=None, agent_cls=cls)
     turn = cls.turns[0]
     assert turn["agent"]._memory_manager is None
-    assert turn["cached_agent"] is None
+    assert_cached_memoryless(turn["cached_agent"], turn["agent"])
     assert provider.inits == []
     assert bank_rows(homes["default"]) == []
 

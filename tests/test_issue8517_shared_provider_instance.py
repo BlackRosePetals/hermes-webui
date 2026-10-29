@@ -18,6 +18,7 @@ the claim is refused, and only then calls ``initialize``. One test drives the RE
 
 "Wrong-bank row": a row in profile H's bank written by an agent serving another profile.
 """
+# ruff: noqa: F811  (pytest fixtures imported from the #8517 P0/P1 module)
 from __future__ import annotations
 
 import inspect

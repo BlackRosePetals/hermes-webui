@@ -43,6 +43,7 @@ from tests.test_issue8517_profile_scoped_memory import (  # noqa: F401  (fixture
     HeldWriter,
     SharedInstanceMemoryProvider,
     _cached_agent,
+    assert_cached_memoryless,
     bank_rows,
     hc,
     homes,
@@ -144,7 +145,7 @@ def test_legacy_root_admission_cannot_race_a_profile_created_before_the_bind(
     assert Agent.turns, "the turn never reached run_conversation"
     assert provider.inits == []
     assert not bank_rows(homes["beta"]), f"root wrote into beta's bank: {bank_rows(homes['beta'])}"
-    assert _cached_agent(sid) is None
+    assert_cached_memoryless(_cached_agent(sid), Agent.turns[0]["agent"])
 
 
 def test_legacy_agent_turn_and_commit_scopes_refuse(legacy_hc, homes, scope_state):

@@ -16,10 +16,10 @@
 Every test below was RED on f532dada6 except the explicit no-behaviour-change
 guards (single-profile / per-profile keep-memory cases).
 """
+# ruff: noqa: F811  (pytest fixtures imported from the #8517 P0/P1 module)
 from __future__ import annotations
 
 import logging
-import os
 import sys
 import types
 from pathlib import Path
@@ -300,7 +300,8 @@ def test_no_claim_seam_single_profile_root_keeps_external_memory(hc, homes, root
         profile_home=str(homes["default"]), session_id="root-session")
     assert agent._memory_manager is not None and cacheable is True
     assert [i["home"] for i in provider.inits] == [str(homes["default"])]
-    assert not _warnings(caplog, "several profiles")
+    assert not _warnings(caplog, "Upgrade the Agent to restore them")
+    assert not _warnings(caplog, "memory provider disabled for session")
 
 
 def test_once_two_homes_were_served_an_old_agent_stays_fail_closed(hc, homes, root_is, scope_state, monkeypatch):

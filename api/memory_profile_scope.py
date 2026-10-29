@@ -655,7 +655,8 @@ def _claim_for_profile(original: Callable[[Any, Any], bool], provider: Any, home
 def install_shared_provider_instance_guard() -> bool:
     """Wrap the Agent's ``agent.memory_manager.claim_instance`` once per loaded module.
     True when the guard is active. Agents without that seam (before 2026-10-17) are
-    left as they are and logged once: their shared-instance providers are unguarded."""
+    left as they are and logged once; ``construct_profile_scoped_agent`` then turns
+    external providers off unless this process serves a single profile."""
     try:
         mm = sys.modules.get("agent.memory_manager") or importlib.import_module("agent.memory_manager")
     except Exception:
@@ -672,8 +673,9 @@ def install_shared_provider_instance_guard() -> bool:
         _log_once(
             "shared-guard-seam",
             "[webui] #8517: this Hermes Agent has no memory provider instance claim (older "
-            "than 2026-10-17); a provider that hands every agent one shared instance can "
-            "mix profiles' memory. Upgrade the Agent.",
+            "than 2026-10-17); a provider that hands every agent one shared instance could "
+            "mix profiles' memory, so external memory providers stay off while this WebUI "
+            "serves several profiles. Upgrade the Agent.",
         )
         return False
     with _install_lock:

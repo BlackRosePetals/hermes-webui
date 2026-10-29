@@ -6115,6 +6115,7 @@ main.main > #mainPlugin{display:none;}
    past the viewport's height now that its rows are taller there. */
 .project-picker-item:focus-visible{background:rgba(255,255,255,.08);color:var(--text);outline:2px solid var(--focus-ring);outline-offset:-2px;}
 .project-picker-item.active:focus-visible{color:var(--blue);}
+.project-picker-create:focus-visible{background:linear-gradient(rgba(255,255,255,.08),rgba(255,255,255,.08)),var(--sidebar);}
 /* On a light theme the white wash above is invisible and the translucent
    --focus-ring is about 1.5:1 on the picker: the theme's own hover wash under
    the pointer, and the skin's --accent-text as the focus ring. Not --accent:

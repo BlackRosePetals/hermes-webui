@@ -901,7 +901,10 @@ MIDDLE_ROW_JS = """() => {
   const middle = innerHeight / 2;
   rows.sort((a, b) => Math.abs(a.getBoundingClientRect().top - middle) - Math.abs(b.getBoundingClientRect().top - middle));
   const title = rows[0].querySelector('.session-title').getBoundingClientRect();
-  return {x: title.left + title.width / 2, y: title.top + title.height / 2};
+  // Three quarters along the title, still on it: master's rows give the title
+  // less room, and from its centre a drag left is too short to tell from a
+  // swipe and the ⋮ menu (aligned to the row's right) opens beside the finger.
+  return {x: title.left + title.width * 0.75, y: title.top + title.height / 2};
 }"""
 
 # Every click from here on, by what it landed on.
@@ -943,15 +946,25 @@ def _pen(session, kind, point):
     )
 
 
+# The boot's fire-and-forget update check (static/boot.js, once per tab session)
+# is a POST that can land after recording starts. No gesture sends it.
+BACKGROUND_WRITES = ("updates/check",)
+
+
 def _record_writes(page):
-    """Every request from here on that is not a GET, as "METHOD path"."""
+    """Every request from here on that is not a GET, as "METHOD path", other
+    than the boot's background update check."""
     writes = []
-    page.on(
-        "request",
-        lambda request: writes.append(f"{request.method} {request.url.split('/api/')[-1]}")
-        if "/api/" in request.url and request.method != "GET"
-        else None,
-    )
+
+    def record(request):
+        if "/api/" not in request.url or request.method == "GET":
+            return
+        path = request.url.split("/api/")[-1]
+        if path.split("?")[0] in BACKGROUND_WRITES:
+            return
+        writes.append(f"{request.method} {path}")
+
+    page.on("request", record)
     return writes
 
 
@@ -1769,9 +1782,10 @@ HOVER_WASH_JS = """() => {
   const row = document.querySelector('.project-picker:not(.batch-project-picker) .project-picker-item:hover');
   return {
     wash: row ? getComputedStyle(row).backgroundColor : null,
+    image: row ? getComputedStyle(row).backgroundImage : null,
     create: !!row && row.classList.contains('project-picker-create'),
     focused: !!row && row === document.activeElement,
-    hoverBg: resolved('--hover-bg'), accentBg: resolved('--accent-bg'),
+    hoverBg: resolved('--hover-bg'), accentBg: resolved('--accent-bg'), sidebar: resolved('--sidebar'),
   };
 }"""
 
@@ -1853,14 +1867,15 @@ def _check_focus_cue(page, seed):
                         f"  [focus cue, dark] the ring is {cue['ring']}, expected --focus-ring ({cue['focusRing']})"
                     )
                 if theme == "dark":
-                    # "+ New project" is left as it was on dark: still at 70%.
+                    # "+ New project" is left as master draws it on dark: since the sticky
+                    # row (27ad682b9) that is full opacity, dimmed by a 70% colour mix instead.
                     page.keyboard.press("End")
                     page.wait_for_timeout(SETTLE_MS)
                     create = page.evaluate(FOCUS_CUE_JS)
-                    if not create.get("create") or create.get("opacity") != 0.7:
+                    if not create.get("create") or create.get("opacity") != 1:
                         failures.append(
                             f"  [focus cue, dark, + New project] focused row: create={create.get('create')},"
-                            f" opacity {create.get('opacity')}, expected the 0.7 it had"
+                            f" opacity {create.get('opacity')}, expected master's 1"
                         )
                     # Back to a project row: the pointer checks below are for
                     # rows that do not also have keyboard focus.
@@ -1893,14 +1908,21 @@ def _check_focus_cue(page, seed):
             if theme == "light" and hovered["hoverBg"] != "rgba(0, 0, 0, 0.05)":
                 failures.append(f"  [focus cue, light] --hover-bg is {hovered['hoverBg']} on the default skin")
             # "+ New project" keeps its own accent tint under the pointer, on
-            # both themes: the rows' wash must not take it over.
+            # both themes: the rows' wash must not take it over. The row is sticky
+            # over a scrolling list, so master (27ad682b9) paints the tint as a
+            # gradient over an opaque --sidebar: rows under it must not show through.
             page.hover(f"{SINGLE} .project-picker-create")
             page.wait_for_timeout(250)
             hovered = page.evaluate(HOVER_WASH_JS)
-            if not hovered["create"] or hovered["wash"] != hovered["accentBg"]:
+            if (
+                not hovered["create"]
+                or hovered["accentBg"] not in (hovered["image"] or "")
+                or hovered["wash"] != hovered["sidebar"]
+            ):
                 failures.append(
-                    f"  [focus cue, {theme}] '+ New project' under the pointer is {hovered['wash']},"
-                    f" expected --accent-bg ({hovered['accentBg']})"
+                    f"  [focus cue, {theme}] '+ New project' under the pointer is {hovered['image']} over"
+                    f" {hovered['wash']}, expected --accent-bg ({hovered['accentBg']}) over an opaque --sidebar"
+                    f" ({hovered['sidebar']})"
                 )
             page.mouse.move(700, 450)
             page.keyboard.press("Escape")

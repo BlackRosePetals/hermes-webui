@@ -515,6 +515,22 @@ def test_on_a_light_theme_the_ring_is_the_text_accent_and_the_pointer_has_a_wash
     assert ".project-picker-create:hover{background:var(--accent-bg);}" not in STYLE_CSS
 
 
+def test_the_sticky_create_row_stays_opaque_under_keyboard_focus():
+    """Fable r6: ".project-picker-item:focus-visible" paints a translucent tint
+    at (0,2,0), which outranks the sticky "+ New project" row's opaque
+    var(--sidebar) at (0,1,0). With the list scrolled, a row underneath showed
+    through the focused create row in both themes. Restate the tint over
+    var(--sidebar) after the item rule so the sticky row stays opaque."""
+    item = ".project-picker-item:focus-visible{background:rgba(255,255,255,.08);"
+    create = (
+        ".project-picker-create:focus-visible"
+        "{background:linear-gradient(rgba(255,255,255,.08),rgba(255,255,255,.08)),var(--sidebar);}"
+    )
+    assert item in STYLE_CSS
+    assert create in STYLE_CSS
+    assert STYLE_CSS.index(item) < STYLE_CSS.index(create)
+
+
 def test_the_menu_that_opens_the_picker_has_finger_tall_rows_on_touch():
     assert (
         "@media (pointer:coarse){.session-action-opt .ws-opt-action{min-height:44px;}}" in STYLE_CSS

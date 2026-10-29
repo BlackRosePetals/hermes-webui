@@ -26,14 +26,25 @@ memory scope (Agent commit 419e6627, 2026-10-17) have no ``_bound_scope``; their
 binding cannot be read back and is trusted to the override (logged once).
 Agents older than v0.18.0 have no context-local override at all; see
 ``_enter_profile_home``.
+
+``install_shared_provider_instance_guard`` (#8517 P4) covers what a correct
+binding cannot: a provider that hands every agent ONE process-wide instance
+(mnemosyne-hermes 0.7.1). Each construction re-initialises that instance for its
+own profile, so another profile's cached agent then reads and writes this
+profile's bank. The guard makes the first profile home that initialises such an
+instance its only owner for the life of the process; every other profile is
+refused BEFORE ``initialize`` runs and builds without that provider.
 """
 from __future__ import annotations
 
+import functools
+import importlib
 import inspect
 import logging
 import os
 import sys
 import threading
+import weakref
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -241,6 +252,7 @@ def construct_profile_scoped_agent(
     SESSION_AGENT_CACHE, so the next turn builds again with memory.
     ``agent_kwargs`` is never mutated.
     """
+    install_shared_provider_instance_guard()
     params = _constructor_params(agent_cls) if agent_params is None else set(agent_params)
     target_key = profile_home_key(profile_home)
     restore, reason = _enter_profile_home(profile_home, target_key)
@@ -405,4 +417,112 @@ def call_as_session_owner(
             what, session_id, hook,
         )
         return False
+    return True
+
+
+# ── one shared provider instance, one profile (#8517 P4) ────────────────────
+#
+# The Agent's ``MemoryManager.initialize_all`` calls
+# ``claim_instance(provider, hermes_home)`` (agent/memory_caller_scope.py, looked up
+# through the ``agent.memory_manager`` module global) for every external provider,
+# drops the provider when the claim is refused, and only then calls
+# ``provider.initialize(hermes_home=...)``. The Agent refuses a second profile only on
+# a multiplexed gateway; WebUI serves several profiles in one process without that
+# flag (turning it on breaks the second profile's memory and WebUI credential reads),
+# so an instance shared by the plugin would be re-pointed by every construction.
+# The guard wraps that one call: an instance already initialised for another profile
+# home is refused before ``initialize`` runs. Refusal happens inside the Agent's own
+# path, so the Agent drops the provider, keeps built-in memory and tells the user
+# through its startup-warning sink. Fresh instances (the documented provider
+# contract) and single-profile installs never see a second home: no change.
+
+_instance_owners: dict[int, tuple[Callable[[], Any], str]] = {}
+_instance_owners_lock = threading.Lock()
+_install_lock = threading.Lock()
+_GUARD_MARK = "_webui_issue8517_shared_instance_guard"
+_PRUNE_AT = 64
+
+
+def _instance_ref(provider: Any) -> Callable[[], Any]:
+    """Weak reference to ``provider``; a strong one when it cannot be weakly referenced,
+    so its ``id()`` can never be reused by another instance while it is tracked."""
+    try:
+        return weakref.ref(provider)
+    except TypeError:
+        return lambda: provider
+
+
+def _prune_dead_owners() -> None:
+    if len(_instance_owners) < _PRUNE_AT:
+        return
+    for pid, (ref, _key) in list(_instance_owners.items()):
+        if ref() is None:
+            del _instance_owners[pid]
+
+
+def _claim_for_profile(original: Callable[[Any, Any], bool], provider: Any, home: Any) -> bool:
+    """``claim_instance`` that also refuses a cross-profile rebind without multiplexing."""
+    key = profile_home_key(home) or str(home or "")
+    pid = id(provider)
+    with _instance_owners_lock:
+        entry = _instance_owners.get(pid)
+        owner = entry[1] if entry is not None and entry[0]() is provider else None
+        if owner is None or owner == key:
+            # The Agent's own claim keeps its bookkeeping and multiplex refusal; only an
+            # accepted claim makes this home the owner.
+            if not original(provider, home):
+                return False
+            if owner is None:
+                _prune_dead_owners()
+                _instance_owners[pid] = (_instance_ref(provider), key)
+            return True
+    name = getattr(provider, "name", "?")
+    _log_once(
+        f"shared:{name}:{owner}:{key}",
+        "[webui] #8517: memory provider %r is disabled for profile home %r: the plugin "
+        "returned the same shared provider instance that already serves profile home %r "
+        "in this WebUI process, and initialising it again would point that profile's "
+        "live agents at this profile's memory. This profile runs without that provider "
+        "(built-in memory still works) until the WebUI restarts; the first profile to use "
+        "it keeps it. The provider must return a new instance per agent.",
+        name, str(home), owner,
+    )
+    return False
+
+
+def install_shared_provider_instance_guard() -> bool:
+    """Wrap the Agent's ``agent.memory_manager.claim_instance`` once per loaded module.
+    True when the guard is active. Agents without that seam (before 2026-10-17) are
+    left as they are and logged once: their shared-instance providers are unguarded."""
+    try:
+        mm = sys.modules.get("agent.memory_manager") or importlib.import_module("agent.memory_manager")
+    except Exception:
+        _log_once(
+            "shared-guard-import",
+            "[webui] #8517: could not import agent.memory_manager; a memory provider that "
+            "shares one instance across profiles is not guarded in this process.",
+        )
+        return False
+    current = getattr(mm, "claim_instance", None)
+    if getattr(current, _GUARD_MARK, False):
+        return True
+    if not callable(current):
+        _log_once(
+            "shared-guard-seam",
+            "[webui] #8517: this Hermes Agent has no memory provider instance claim (older "
+            "than 2026-10-17); a provider that hands every agent one shared instance can "
+            "mix profiles' memory. Upgrade the Agent.",
+        )
+        return False
+    with _install_lock:
+        current = getattr(mm, "claim_instance", None)
+        if getattr(current, _GUARD_MARK, False):
+            return True
+
+        @functools.wraps(current)
+        def claim_instance(provider: Any, home: Any) -> bool:
+            return _claim_for_profile(current, provider, home)
+
+        setattr(claim_instance, _GUARD_MARK, True)
+        mm.claim_instance = claim_instance
     return True

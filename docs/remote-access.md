@@ -152,9 +152,12 @@ them apart. Only do it when the proxy is the sole local client that reaches
 WebUI. Per-client buckets need `X-Forwarded-For`. A request carrying only
 `X-Real-IP` keys on the proxy's shared bucket, because nginx relays a
 client-supplied `X-Real-IP` unless the config overwrites it, and that would let
-a client pick a fresh bucket on every attempt. Appending to `X-Forwarded-For`
-(nginx's `$proxy_add_x_forwarded_for`) is fine, because WebUI walks the chain
-from the right. Have the proxy overwrite
+a client pick a fresh bucket on every attempt. The same holds for
+`X-Forwarded-For` itself: list a proxy only if it appends to the chain (nginx's
+`$proxy_add_x_forwarded_for`) or overwrites it. A bare `proxy_pass` relays the
+client's own `X-Forwarded-For` unchanged, so a listed proxy that does not write
+the header lets every client choose its login bucket. Appending is fine, because
+WebUI walks the chain from the right. Have the proxy overwrite
 `X-Real-IP` (`proxy_set_header X-Real-IP $remote_addr;`). If it relays a
 client-supplied value that disagrees with the chain, or one that is not an
 address, WebUI falls back to the shared bucket.

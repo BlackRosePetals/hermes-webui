@@ -7359,11 +7359,12 @@ def _forwarded_client_ip_from_trusted_proxy(handler, consult_real_ip: bool = Tru
         and then the raw peer. The local-origin gate, trusted-header SSO and other
         consumers that predate #7863 keep exactly the resolution they had.
       * ``False`` never reads ``X-Real-IP`` at all and goes straight to the raw
-        peer. This is the request-log path only: the structured log is a security
-        boundary (its ``forwarded_for`` feed fail2ban), and ``X-Real-IP`` is a
-        second client-writable header (nginx relays client-supplied values through
-        by default instead of overwriting it), so honoring it there would
-        reintroduce #7863 through a different header.
+        peer. The request log and the login rate limiter use it: the structured
+        log is a security boundary (its ``forwarded_for`` feed fail2ban), and
+        ``X-Real-IP`` is a second client-writable header (nginx relays
+        client-supplied values through by default instead of overwriting it), so
+        honoring it there would reintroduce #7863 through a different header, and
+        on the login limiter would let a client pick its bucket (#8591).
 
     The XFF walk is identical either way — the right-most hop was appended by the
     trusted peer itself, so it carries the same guarantee with or without the
@@ -7422,9 +7423,9 @@ def _forwarded_client_ip_from_trusted_proxy(handler, consult_real_ip: bool = Tru
         real_ip = handler.headers.get("X-Real-IP", "").strip()
         if real_ip:
             return real_ip
-    # Without a forwarded chain the trusted proxy is speaking for itself. On the
-    # request-log path (consult_real_ip=False) this is also the fail-closed
-    # fallback: no forwarded chain, no forwarded identity.
+    # Without a forwarded chain the trusted proxy is speaking for itself. With
+    # consult_real_ip=False (the request log, the login limiter) this is also the
+    # fail-closed fallback: no forwarded chain, no forwarded identity.
     return _request_client_ip(handler)
 
 

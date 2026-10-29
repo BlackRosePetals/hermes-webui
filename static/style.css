@@ -4415,6 +4415,11 @@ body.resizing .sidebar{transition:none!important;}
   border-color:var(--border-subtle);
   background:color-mix(in srgb,var(--surface-subtle) 48%,transparent);
 }
+/* Hover on an open row should brighten it, not fade it back below its open tint (62%). */
+.transparent-event-row[data-expanded="1"]:hover,
+.transparent-event-row[data-expanded="1"]:focus-within{
+  background:color-mix(in srgb,var(--surface-subtle) 72%,transparent);
+}
 /* Transparent Stream: both tool AND thinking inner cards must reset to a flat,
    transparent row. The thinking-card previously kept its base accent-bg/border/
    radius/msg-rail chrome (it was the heaviest object in the stream — Frank's

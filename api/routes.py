@@ -41,6 +41,11 @@ from api.agent_runtime import (
     ensure_agent_runtime_current,
     require_ai_agent_class,
 )
+from api.memory_profile_scope import (
+    construct_memoryless_helper_agent,
+    construct_profile_scoped_agent,
+    session_profile_home_or_empty,
+)
 from api.agent_sessions import (
     MESSAGING_SOURCES,
     _looks_like_default_cli_title,
@@ -17925,16 +17930,20 @@ def _llm_update_summary(system_prompt: str, user_prompt: str, active_profile: st
 
         AIAgent = require_ai_agent_class()
 
-        agent = AIAgent(
-            model=_main_model,
-            provider=_main_provider,
-            base_url=_main_base_url,
-            api_key=_main_api_key,
-            platform="webui",
-            quiet_mode=True,
-            enabled_toolsets=[],
-            session_id=f"updates-summary-{uuid.uuid4().hex[:8]}",
-            **_agent_bundle_kwargs(AIAgent, _bundle),
+        agent = construct_memoryless_helper_agent(
+            AIAgent,
+            dict(
+                model=_main_model,
+                provider=_main_provider,
+                base_url=_main_base_url,
+                api_key=_main_api_key,
+                platform="webui",
+                quiet_mode=True,
+                enabled_toolsets=[],
+                session_id=f"updates-summary-{uuid.uuid4().hex[:8]}",
+                **_agent_bundle_kwargs(AIAgent, _bundle),
+            ),
+            purpose="update summary",
         )
         result = agent.run_conversation(
             user_message=user_prompt,
@@ -30095,19 +30104,27 @@ def _handle_chat_sync(handler, body):
             # rotation (agent.session_id advancing to a fresh continuation) is
             # visible to the settle below.
             _sync_session_id = s.session_id
-            agent = AIAgent(
-                model=_model,
-                provider=_provider,
-                base_url=_base_url,
-                api_key=_api_key,
-                # Identify browser-originated sessions as WebUI so Hermes Agent
-                # does not inject CLI-specific terminal/output guidance.
-                platform="webui",
-                quiet_mode=True,
-                enabled_toolsets=_resolve_cli_toolsets(),
+            # #8517: this agent uses memory, so it is built inside the session's own
+            # profile home (fails closed to no memory if that cannot be set). The
+            # agent is not cached, so the cacheable flag is unused.
+            agent, _ = construct_profile_scoped_agent(
+                AIAgent,
+                dict(
+                    model=_model,
+                    provider=_provider,
+                    base_url=_base_url,
+                    api_key=_api_key,
+                    # Identify browser-originated sessions as WebUI so Hermes Agent
+                    # does not inject CLI-specific terminal/output guidance.
+                    platform="webui",
+                    quiet_mode=True,
+                    enabled_toolsets=_resolve_cli_toolsets(),
+                    session_id=s.session_id,
+                    **_routing_kwargs,
+                    **_agent_bundle_kwargs(AIAgent, _bundle),
+                ),
+                profile_home=session_profile_home_or_empty(s),
                 session_id=s.session_id,
-                **_routing_kwargs,
-                **_agent_bundle_kwargs(AIAgent, _bundle),
             )
             from api.streaming import (
                 _WEBUI_PROGRESS_PROMPT,
@@ -30905,16 +30922,20 @@ def _llm_git_commit_message(system_prompt: str, user_prompt: str, session=None) 
 
         AIAgent = require_ai_agent_class()
 
-        agent = AIAgent(
-            model=_main_model,
-            provider=_main_provider,
-            base_url=_main_base_url,
-            api_key=_main_api_key,
-            platform="webui",
-            quiet_mode=True,
-            enabled_toolsets=[],
-            session_id=f"git-commit-message-{uuid.uuid4().hex[:8]}",
-            **_agent_bundle_kwargs(AIAgent, _bundle),
+        agent = construct_memoryless_helper_agent(
+            AIAgent,
+            dict(
+                model=_main_model,
+                provider=_main_provider,
+                base_url=_main_base_url,
+                api_key=_main_api_key,
+                platform="webui",
+                quiet_mode=True,
+                enabled_toolsets=[],
+                session_id=f"git-commit-message-{uuid.uuid4().hex[:8]}",
+                **_agent_bundle_kwargs(AIAgent, _bundle),
+            ),
+            purpose="git commit message",
         )
         result = agent.run_conversation(
             user_message=user_prompt,
@@ -33142,18 +33163,25 @@ def _handle_session_compress(handler, body):
         )
         approx_tokens = _estimate_messages_tokens_rough(original_messages)
 
-        agent = AIAgent(
-            model=resolved_model,
-            provider=resolved_provider,
-            base_url=resolved_base_url,
-            api_key=resolved_api_key,
-            # Identify browser-originated sessions as WebUI so Hermes Agent
-            # does not inject CLI-specific terminal/output guidance.
-            platform="webui",
-            quiet_mode=True,
-            enabled_toolsets=_resolve_cli_toolsets(),
-            session_id=sid,
-            **_agent_bundle_kwargs(AIAgent, _bundle),
+        # #8517: compression only needs the model. Building it with memory would
+        # re-initialise a shared provider instance for whatever profile the UI is
+        # on now, and this session's next cached turn would write into that bank.
+        agent = construct_memoryless_helper_agent(
+            AIAgent,
+            dict(
+                model=resolved_model,
+                provider=resolved_provider,
+                base_url=resolved_base_url,
+                api_key=resolved_api_key,
+                # Identify browser-originated sessions as WebUI so Hermes Agent
+                # does not inject CLI-specific terminal/output guidance.
+                platform="webui",
+                quiet_mode=True,
+                enabled_toolsets=_resolve_cli_toolsets(),
+                session_id=sid,
+                **_agent_bundle_kwargs(AIAgent, _bundle),
+            ),
+            purpose="manual compression",
         )
         compressed = agent.context_compressor.compress(
             original_messages,
@@ -33838,16 +33866,20 @@ def _handle_handoff_summary(handler, body):
                 "fallback": True,
             })
 
-        agent = AIAgent(
-            model=resolved_model,
-            provider=resolved_provider,
-            base_url=resolved_base_url,
-            api_key=resolved_api_key,
-            platform="webui",
-            quiet_mode=True,
-            enabled_toolsets=[],
-            session_id=sid,
-            **_agent_bundle_kwargs(AIAgent, _bundle),
+        agent = construct_memoryless_helper_agent(
+            AIAgent,
+            dict(
+                model=resolved_model,
+                provider=resolved_provider,
+                base_url=resolved_base_url,
+                api_key=resolved_api_key,
+                platform="webui",
+                quiet_mode=True,
+                enabled_toolsets=[],
+                session_id=sid,
+                **_agent_bundle_kwargs(AIAgent, _bundle),
+            ),
+            purpose="handoff summary",
         )
 
         summary_system_prompt = (

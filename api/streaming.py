@@ -82,7 +82,11 @@ from api.run_journal import RunJournalWriter
 from api.todo_state import attach_todo_state, emit_todo_state
 from api.turn_journal import append_turn_journal_event_for_stream
 from api.usage import prompt_cache_hit_percent
-from api.memory_profile_scope import construct_profile_scoped_agent, session_profile_home_or_empty
+from api.memory_profile_scope import (
+    call_as_session_owner,
+    construct_profile_scoped_agent,
+    session_profile_home_or_empty,
+)
 from api.models import (
     StateDBSessionMessagesSnapshot,
     _cancelled_journal_turn_owner,
@@ -13558,6 +13562,14 @@ def _close_evicted_agent_at_session_boundary(session_id: str, agent) -> bool:
         return True
 
     should_close_evicted_agent = True
+    # #8517: the owner's profile, captured before a clean commit discards the
+    # lifecycle entry; the provider shutdown below must run as that profile too.
+    _owner_home = ''
+    try:
+        from api.session_lifecycle import recorded_owner_profile_home
+        _owner_home = recorded_owner_profile_home(session_id)
+    except Exception:
+        logger.debug("No recorded owner profile for evicted session %s", session_id, exc_info=True)
     try:
         _lifecycle_commit_session_memory(session_id, agent=agent, wait=True)
         if not _lifecycle_has_uncommitted_work(session_id):
@@ -13579,7 +13591,13 @@ def _close_evicted_agent_at_session_boundary(session_id: str, agent) -> bool:
         shutdown_memory_provider = getattr(agent, 'shutdown_memory_provider', None)
         if callable(shutdown_memory_provider):
             session_messages = vars(agent).get('_session_messages', [])
-            shutdown_memory_provider(session_messages)
+            call_as_session_owner(
+                agent,
+                lambda: shutdown_memory_provider(session_messages),
+                session_id=session_id,
+                owner_home=_owner_home,
+                what="memory provider shutdown",
+            )
     except Exception:
         logger.debug("Failed to shut down evicted agent memory provider for session %s", session_id, exc_info=True)
 
@@ -17489,7 +17507,12 @@ def _run_agent_streaming(
                     # per-session writeback lock to preserve completed-turn ordering.
                     try:
                         from api.session_lifecycle import mark_turn_completed
-                        mark_turn_completed(s.session_id, agent=agent)
+                        try:
+                            _owner_profile_home = _profile_home
+                        except NameError:
+                            _owner_profile_home = ''
+                        # #8517: record the owner so boundary commits run as it.
+                        mark_turn_completed(s.session_id, agent=agent, profile_home=_owner_profile_home)
                     except Exception:
                         logger.debug("Memory lifecycle mark failed for session %s", s.session_id, exc_info=True)
                 with _stream_writeback_stage(_writeback_timings, "persistent_state_scan"):

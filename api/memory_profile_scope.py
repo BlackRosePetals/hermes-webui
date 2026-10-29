@@ -205,6 +205,26 @@ def _build_without_memory(agent_cls: Any, agent_kwargs: dict, params: set) -> An
     return agent
 
 
+def construct_memoryless_helper_agent(agent_cls: Any, agent_kwargs: dict, *, purpose: str = "") -> Any:
+    """Build a one-shot helper agent (manual compression, summaries, commit
+    messages) that never touches memory (#8517 P2).
+
+    With memory on, ``AIAgent.__init__`` initialises the memory provider for
+    whatever home the request thread's ambient state names. A provider that hands
+    every agent one shared instance is then re-pointed at that profile, and the
+    owning session's next cached turn writes into the other profile's bank. These
+    helpers only need the model, so memory is skipped outright.
+
+    ``skip_memory`` is passed only when the constructor names it (Agent
+    2026-02-19+; external memory providers arrived later, 2026-04-02, so an
+    Agent without the parameter has none). Any manager is still detached. The
+    caller's ``agent_kwargs`` is never mutated.
+    """
+    agent = _build_without_memory(agent_cls, agent_kwargs, _constructor_params(agent_cls))
+    logger.debug("[webui] built memoryless helper agent for %s", purpose or "helper")
+    return agent
+
+
 def construct_profile_scoped_agent(
     agent_cls: Any,
     agent_kwargs: dict,
@@ -254,3 +274,135 @@ def construct_profile_scoped_agent(
         return agent, True
     finally:
         restore()
+
+
+# ── #8517 P3: session-boundary commits run as the session's owner ─────────────
+
+# Logger the Agent's caller-scope check refuses on (agent/memory_caller_scope._refuse).
+_CALLER_SCOPE_LOGGER = "agent.memory_caller_scope"
+
+
+def agent_bound_memory_home(agent: Any) -> str:
+    """The home the agent's memory manager says it was initialised for, or ``""``."""
+    manager = getattr(agent, "_memory_manager", None)
+    scope = getattr(manager, "_bound_scope", None) if manager is not None else None
+    if isinstance(scope, dict):
+        home = scope.get("hermes_home")
+        if isinstance(home, str) and home.strip():
+            return home
+    return ""
+
+
+def session_owner_profile_home(session_id: str) -> str:
+    """The profile home of the session ``session_id`` belongs to, looked up from the
+    session store; ``""`` when the session or its profile cannot be resolved."""
+    if not session_id:
+        return ""
+    try:
+        from api.models import get_session_profile_readonly  # noqa: PLC0415
+        from api.profiles import get_hermes_home_for_profile  # noqa: PLC0415
+
+        # Read-only ownership lookup: no sidecar repair, no cache publication.
+        home = get_hermes_home_for_profile(get_session_profile_readonly(session_id))
+        return str(home) if home else ""
+    except Exception:
+        logger.debug("[webui] #8517: no owner profile for session %s", session_id, exc_info=True)
+        return ""
+
+
+class _HookRefusalCapture(logging.Handler):
+    """Notices the Agent refusing ``hook`` on THIS thread. The Agent's lifecycle
+    hooks return nothing when its caller-scope check refuses them; the only
+    signal is its WARNING (agent/memory_caller_scope._refuse)."""
+
+    def __init__(self, hook: str):
+        super().__init__(logging.WARNING)
+        self._needle = f"hook {hook}"
+        self._thread = threading.get_ident()
+        self.refused = False
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.thread != self._thread:
+            return
+        try:
+            message = record.getMessage()
+        except Exception:
+            return
+        if "refused" in message and self._needle in message:
+            self.refused = True
+
+
+def _enter_session_owner_scope(agent: Any, session_id: str, owner_home: str) -> tuple[Callable[[], None], Optional[str]]:
+    """Set the context-local home to the session owner's profile for a lifecycle
+    hook on ``agent``. ``(restore, reason)``: ``reason`` set means do not run it."""
+    if getattr(agent, "_memory_manager", None) is None:
+        return _noop, None  # no external memory: nothing to bind, nothing to refuse
+    bound_home = agent_bound_memory_home(agent)
+    owner = str(owner_home or "").strip() or session_owner_profile_home(session_id) or bound_home
+    if not owner:
+        # Agent from before _bound_scope (2026-10-17) and no resolvable session:
+        # it has no caller-scope check either, so the hook runs as before.
+        _log_once(
+            "owner-unknown",
+            "[webui] #8517: cannot tell which profile owns a session-boundary memory "
+            "commit (Agent without a bound scope); running it unscoped.",
+        )
+        return _noop, None
+    owner_key = profile_home_key(owner)
+    state, bound_key = _bound_memory_home_key(agent)
+    if state == "bound" and bound_key != owner_key:
+        return _noop, (
+            f"its memory provider is bound to {bound_key!r}, not the session's profile home {owner_key!r}"
+        )
+    mod = _hermes_constants()
+    if not callable(getattr(mod, "set_hermes_home_override", None)):
+        # Hermes Agent < v0.18.0: no context-local home and no caller-scope check;
+        # the provider commits where it was bound at construction.
+        return _noop, None
+    return _enter_profile_home(owner, owner_key)
+
+
+def call_as_session_owner(
+    agent: Any,
+    fn: Callable[[], Any],
+    *,
+    session_id: str,
+    owner_home: str = "",
+    hook: str = "on_session_end",
+    what: str = "memory commit",
+) -> bool:
+    """Run ``fn`` (a lifecycle call on ``agent``) under the profile of the session
+    that owns it, never the caller's (#8517 P3).
+
+    Session boundaries fire from other profiles' turns (LRU eviction), from fresh
+    threads (``/api/session/new`` previous-session commit, shutdown drain) whose
+    ambient home is the shared env mirror. The Agent then refuses
+    ``on_session_end`` silently. Returns True only when ``fn`` ran and the Agent
+    did not refuse ``hook``; on False a WARNING is logged and the caller must keep
+    the work pending. Exceptions from ``fn`` propagate.
+    """
+    restore, reason = _enter_session_owner_scope(agent, session_id, owner_home)
+    if reason is not None:
+        logger.warning(
+            "[webui] #8517: %s for session %s not run: %s. The work stays pending "
+            "and is retried at the next session boundary.",
+            what, session_id, reason,
+        )
+        return False
+    capture = _HookRefusalCapture(hook)
+    scope_logger = logging.getLogger(_CALLER_SCOPE_LOGGER)
+    scope_logger.addHandler(capture)
+    try:
+        fn()
+    finally:
+        scope_logger.removeHandler(capture)
+        restore()
+    if capture.refused:
+        logger.warning(
+            "[webui] #8517: the Agent refused the %s for session %s (%s). It is NOT "
+            "counted as committed; the work stays pending and is retried at the "
+            "next session boundary.",
+            what, session_id, hook,
+        )
+        return False
+    return True

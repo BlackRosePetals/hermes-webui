@@ -60,8 +60,9 @@ def test_manual_compress_after_ui_switch_does_not_rebind_owner_memory(
     base_cls = make_agent_cls(provider)
 
     class CompressingAgent(base_cls):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
+        # Same parameter surface as run_agent.AIAgent (names ``skip_memory``).
+        def __init__(self, session_id=None, skip_memory=False, **kwargs):
+            super().__init__(session_id=session_id, skip_memory=skip_memory, **kwargs)
             self.context_compressor = _FakeCompressor()
 
     sid = _make_session()

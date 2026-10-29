@@ -266,7 +266,7 @@ def _assert_never_admitted_and_server_settled(launch: _Launch, disk: dict) -> No
 # ── (a) the handoff wins: the settle skips the run ──────────────────────────
 
 
-def test_handoff_between_settle_selection_and_cancel_leaves_the_run_reattachable(isolated_sessions, monkeypatch):
+def test_handoff_between_settle_selection_and_cancel_leaves_the_run_reattachable(isolated_sessions, monkeypatch):  # noqa: F811 -- pytest fixture parameter; the module-level import registers the fixture
     """Codex f1: selection before the handoff, cancellation after it."""
     launch = _Launch(monkeypatch, "gw-a-held", hold_admission=True)
     launch.start()
@@ -315,7 +315,7 @@ def test_handoff_between_settle_selection_and_cancel_leaves_the_run_reattachable
 # ── (b) the settle wins: the handoff aborts the admission ───────────────────
 
 
-def test_settle_published_before_the_handoff_never_admits_the_run(isolated_sessions, monkeypatch):
+def test_settle_published_before_the_handoff_never_admits_the_run(isolated_sessions, monkeypatch):  # noqa: F811 -- pytest fixture parameter; the module-level import registers the fixture
     """Codex f2: the stale-owner guard returned silently and the launch still POSTed."""
     launch = _Launch(monkeypatch, "gw-b-held")
     launch.start()
@@ -332,7 +332,7 @@ def test_settle_published_before_the_handoff_never_admits_the_run(isolated_sessi
     assert cancels and all(c.get("cancel_initiator") == "server" for c in cancels), cancels
 
 
-def test_user_stop_before_the_handoff_never_admits_and_keeps_the_cancelled_turn(isolated_sessions, monkeypatch):
+def test_user_stop_before_the_handoff_never_admits_and_keeps_the_cancelled_turn(isolated_sessions, monkeypatch):  # noqa: F811 -- pytest fixture parameter; the module-level import registers the fixture
     """The pre-existing orphan: a Stop just before the handoff still let the launch POST."""
     launch = _Launch(monkeypatch, "gw-user-stop")
     launch.start()
@@ -362,7 +362,7 @@ def test_user_stop_before_the_handoff_never_admits_and_keeps_the_cancelled_turn(
 # ── the reattach window (advisor) ───────────────────────────────────────────
 
 
-def test_settle_racing_a_reattach_never_settles_the_resumable_run(isolated_sessions, monkeypatch):
+def test_settle_racing_a_reattach_never_settles_the_resumable_run(isolated_sessions, monkeypatch):  # noqa: F811 -- pytest fixture parameter; the module-level import registers the fixture
     """The reattach published its stream before marking it durable; a drain settle in
     that gap counted the run as WebUI-owned and wrote a server marker over it."""
     sid, stream_id = _orphaned_gateway_turn(run_id="run_survivor", stream_id="gw-reattach")

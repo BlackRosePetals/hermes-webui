@@ -604,7 +604,14 @@ def test_agent_without_bound_scope_keeps_memory_bound_by_the_override(
 
 
 def test_pre_override_agent_single_profile_keeps_memory(legacy_hc, homes, run_turn):
-    """Agent < v0.18.0 (no context-local home): a root-only install keeps memory."""
+    """Agent < v0.18.0 (no context-local home): a root-only install keeps memory.
+
+    all-r1: 'root-only' is now checked, not assumed: the homes fixture creates the
+    alpha/beta profile directories, which make this a multi-profile install (memory
+    off on an Agent < v0.18.0), so they are removed first."""
+    for name in ("alpha", "beta"):
+        homes[name].rmdir()
+    (homes["default"] / "profiles").rmdir()
     provider = SharedInstanceMemoryProvider(homes["default"])
     agent_cls = make_agent_cls(provider, bound_scope=False)
 

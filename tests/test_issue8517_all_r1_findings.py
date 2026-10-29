@@ -318,7 +318,7 @@ def test_once_two_homes_were_served_an_old_agent_stays_fail_closed(hc, homes, ro
     scope_state.construct_profile_scoped_agent(cls, {"session_id": "g"}, profile_home=str(ghost), session_id="g")
     root_agent, cacheable = scope_state.construct_profile_scoped_agent(
         cls, {"session_id": "r"}, profile_home=str(homes["default"]), session_id="r")
-    assert root_agent._memory_manager is None and cacheable is False and provider.inits == []
+    assert root_agent._memory_manager is None and cacheable is True and provider.inits == []
 
 
 def test_current_agent_keeps_external_memory_for_every_profile(hc, homes, root_is, scope_state):

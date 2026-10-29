@@ -401,11 +401,13 @@ def construct_profile_scoped_agent(
     ``profile_home`` so its memory provider can only bind that profile.
 
     Returns ``(agent, cacheable)``. ``cacheable`` is False when memory was turned
-    off or dropped for this turn; the caller must not put that agent in
-    SESSION_AGENT_CACHE, so the next turn builds again with memory. On an Agent
-    without the context-local override (< v0.18.0) memory is off for the life of
-    the process, so no later turn could build it with memory: that memoryless agent
-    is cacheable, as every agent was before #8517.
+    off or dropped for this turn only; the caller must not put that agent in
+    SESSION_AGENT_CACHE, so the next turn builds again with memory. Two reasons hold
+    for the life of the process instead, so their agents are cacheable, as every
+    agent was before #8517: an Agent without the context-local override
+    (< v0.18.0; all memory off), and an Agent without ``claim_instance`` serving
+    several profiles (external memory off; the Agent cannot gain the seam and served
+    homes only accumulate, so no later turn could build it with external memory).
     ``agent_kwargs`` is never mutated. A non-empty ``fail_closed_reason`` (the
     caller could not hold the profile home for the turn) builds without memory.
 
@@ -418,9 +420,9 @@ def construct_profile_scoped_agent(
     params = _constructor_params(agent_cls) if agent_params is None else set(agent_params)
     target_key = profile_home_key(profile_home)
     restore, reason = _enter_profile_home(profile_home, target_key)
-    # Stable for the process (the Agent has no override API), unlike every other
-    # reason below, which is about this turn only.
-    memory_off_for_process = reason == _LEGACY_AGENT_REASON
+    # Reasons that hold for the life of the process (cacheable) versus reasons about
+    # this turn only (not cacheable, so the next turn retries with memory).
+    stable_for_process = reason == _LEGACY_AGENT_REASON
     try:
         if reason is None and fail_closed_reason:
             reason = fail_closed_reason
@@ -439,15 +441,16 @@ def construct_profile_scoped_agent(
             )
             reason = "external memory providers are off: Agent without claim_instance and several profiles"
             keep_builtin = True
+            stable_for_process = True
         if reason is not None:
             logger.warning(
                 "[webui] #8517: memory provider disabled for session %s this turn: %s "
                 "(profile home %r). The agent is built without memory%s.",
                 session_id, reason, profile_home,
-                "" if memory_off_for_process else " and not cached",
+                "" if stable_for_process else " and not cached",
             )
             agent = _build_without_memory(agent_cls, agent_kwargs, params, keep_builtin=keep_builtin)
-            return agent, memory_off_for_process
+            return agent, stable_for_process
         agent = agent_cls(**agent_kwargs)
         state, bound_key = _bound_memory_home_key(agent)
         if state == "bound" and bound_key != target_key:

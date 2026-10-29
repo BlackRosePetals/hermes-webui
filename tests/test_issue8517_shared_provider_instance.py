@@ -20,10 +20,9 @@ the claim is refused, and only then calls ``initialize``. One test drives the RE
 """
 from __future__ import annotations
 
-import importlib
+import inspect
 import logging
 import sys
-from pathlib import Path
 
 import pytest
 
@@ -254,3 +253,106 @@ def test_per_instance_provider_keeps_memory_for_every_profile(hc, homes, run_tur
     assert len(bank_rows(homes["default"])) == 1
     assert all(_cached_agent(s)._memory_manager is not None for s in (sid_a, sid_b, sid_r))
     assert not [r for r in caplog.records if "#8517" in r.getMessage()]
+
+
+# ── the guard's own contract ────────────────────────────────────────────────
+
+class _Prov:
+    name = "sbxmem"
+
+
+class _SlotProv:  # no __weakref__: cannot be weakly referenced
+    __slots__ = ()
+    name = "slotmem"
+
+
+def test_concurrent_claims_for_two_profiles_leave_exactly_one_owner(hc, homes, guard_state):
+    import threading  # noqa: PLC0415
+
+    assert guard_state.install_shared_provider_instance_guard()
+    provider = _Prov()
+    barrier = threading.Barrier(8)
+    results: dict = {}
+
+    def claim(i):
+        home = homes["alpha"] if i % 2 else homes["beta"]
+        barrier.wait(5)
+        results[i] = (home, mm_mod.claim_instance(provider, str(home)))
+
+    threads = [threading.Thread(target=claim, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    winners = {_key(h) for h, ok in results.values() if ok}
+    assert len(results) == 8 and len(winners) == 1, results
+
+
+def test_a_collected_instance_releases_its_owner(hc, homes, guard_state):
+    import gc  # noqa: PLC0415
+
+    assert guard_state.install_shared_provider_instance_guard()
+    first = _Prov()
+    assert mm_mod.claim_instance(first, str(homes["alpha"]))
+    assert not mm_mod.claim_instance(first, str(homes["beta"]))
+    del first
+    gc.collect()
+    second = _Prov()  # may reuse the id: a dead entry must not refuse it
+    assert mm_mod.claim_instance(second, str(homes["beta"]))
+
+
+def test_the_agents_own_refusal_is_kept_and_not_recorded_as_owner(hc, homes, guard_state, monkeypatch):
+    calls: list = []
+
+    def agent_claim(provider, home):
+        calls.append(str(home))
+        return str(home) != str(homes["alpha"])  # e.g. a multiplexed refusal
+
+    monkeypatch.setattr(mm_mod, "claim_instance", agent_claim)
+    assert guard_state.install_shared_provider_instance_guard()
+    provider = _Prov()
+    assert not mm_mod.claim_instance(provider, str(homes["alpha"]))
+    assert mm_mod.claim_instance(provider, str(homes["beta"]))  # alpha never became the owner
+    assert not mm_mod.claim_instance(provider, str(homes["alpha"]))
+    assert calls == [str(homes["alpha"]), str(homes["beta"])]  # cross-home refusal is WebUI's
+
+
+def test_an_instance_without_weak_reference_support_is_still_tracked(hc, homes, guard_state):
+    assert guard_state.install_shared_provider_instance_guard()
+    provider = _SlotProv()
+    assert mm_mod.claim_instance(provider, str(homes["alpha"]))
+    assert mm_mod.claim_instance(provider, str(homes["alpha"]))
+    assert not mm_mod.claim_instance(provider, str(homes["beta"]))
+
+
+def test_install_is_idempotent_and_reinstalls_on_a_reloaded_module(hc, homes, guard_state, monkeypatch):
+    original = mm_mod.claim_instance
+    assert guard_state.install_shared_provider_instance_guard()
+    guarded = mm_mod.claim_instance
+    assert guarded is not original and guarded.__wrapped__ is original
+    assert guard_state.install_shared_provider_instance_guard()
+    assert mm_mod.claim_instance is guarded  # never wrapped twice
+    monkeypatch.setattr(mm_mod, "claim_instance", original)  # a reloaded Agent module
+    assert guard_state.install_shared_provider_instance_guard()
+    assert mm_mod.claim_instance is not original and mm_mod.claim_instance.__wrapped__ is original
+
+
+def test_agent_without_the_claim_seam_is_left_alone_and_logged_once(guard_state, monkeypatch, caplog):
+    import types  # noqa: PLC0415
+
+    old_agent = types.ModuleType("agent.memory_manager")
+    monkeypatch.setitem(sys.modules, "agent.memory_manager", old_agent)
+    caplog.set_level(logging.WARNING)
+    assert not guard_state.install_shared_provider_instance_guard()
+    assert not guard_state.install_shared_provider_instance_guard()
+    assert not hasattr(old_agent, "claim_instance")
+    assert len([r for r in caplog.records if "no memory provider instance claim" in r.getMessage()]) == 1
+
+
+def test_installed_agent_claims_before_it_initialises():
+    """The seam the guard relies on: initialize_all looks claim_instance up as a module
+    global and drops a refused provider before calling initialize."""
+    src = inspect.getsource(mm_mod.MemoryManager.initialize_all)
+    assert "claim_instance" in mm_mod.MemoryManager.initialize_all.__code__.co_names
+    assert src.index("claim_instance(") < src.index(".initialize(")
+    assert "_drop_provider" in src

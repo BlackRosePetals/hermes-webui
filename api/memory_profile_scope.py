@@ -187,6 +187,47 @@ def _legacy_agent_reason() -> str:
     return "this Hermes Agent has no context-local home override (older than v0.18.0)"
 
 
+def turn_memory_reason(profile_home: str, *, override_installed: bool) -> str:
+    """``""`` when the caller's whole turn verifiably runs in ``profile_home``, else
+    why memory must be off for this turn (#8517 all-r2 finding 2).
+
+    The caller has installed (``override_installed``) the context-local home override
+    for the turn and holds it until the turn ends; this checks that the override
+    took effect: ``get_hermes_home()`` answers ``profile_home`` now, in the turn's
+    own context. A construction-time scope alone is not enough: the built-in store
+    resolves the home on every write and the Agent's providers check the caller's
+    home on every hook, all during ``run_conversation``.
+    """
+    target_key = profile_home_key(profile_home)
+    if not target_key:
+        return "the session's profile home could not be resolved"
+    mod = _hermes_constants()
+    setter = getattr(mod, "set_hermes_home_override", None) if mod is not None else None
+    resetter = getattr(mod, "reset_hermes_home_override", None) if mod is not None else None
+    if not (callable(setter) and callable(resetter)):
+        return _legacy_agent_reason()
+    if not override_installed:
+        return "the turn-level profile home override could not be set"
+    getter = getattr(mod, "get_hermes_home", None)
+    if not callable(getter):
+        return "the turn-level profile home cannot be verified"
+    try:
+        effective = profile_home_key(getter())
+    except Exception:
+        effective = None
+    if effective != target_key:
+        return "the turn-level profile home override did not take effect"
+    return ""
+
+
+def agent_has_memory(agent: Any) -> bool:
+    """True when ``agent`` holds an external memory manager or the built-in store."""
+    return (
+        getattr(agent, "_memory_manager", None) is not None
+        or getattr(agent, "_memory_store", None) is not None
+    )
+
+
 def _enter_profile_home(profile_home: str, target_key: Optional[str]) -> tuple[Callable[[], None], Optional[str]]:
     """Set the context-local Hermes home to ``profile_home``.
 

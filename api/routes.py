@@ -7447,6 +7447,10 @@ def _login_client_ip(handler) -> str:
     of both headers is checked, as the resolver reads them all: fall back to the
     raw peer when they differ, a field is empty, X-Real-IP is repeated with
     different values, or a value is not an IP address.
+
+    A request with no X-Forwarded-For keys on the raw peer even when X-Real-IP
+    is a valid address: X-Real-IP alone may be the client's own value relayed
+    by the proxy, so it never selects a bucket by itself.
     """
     import ipaddress
 
@@ -7460,11 +7464,21 @@ def _login_client_ip(handler) -> str:
     if _truthy_env("HERMES_WEBUI_TRUST_FORWARDED_FOR"):
         try:
             peer = ipaddress.ip_address(_request_client_ip(handler))
-            if _ip_in_networks(peer, _trusted_proxy_networks(include_loopback=False)):
-                client = ipaddress.ip_address(_forwarded_client_ip_from_trusted_proxy(handler))
-                xff = _fields("X-Forwarded-For")
+            xff = _fields("X-Forwarded-For")
+            # Only a non-empty X-Forwarded-For chain can name the client: its
+            # right-most hop is appended by the trusted proxy itself. X-Real-IP
+            # alone is client-writable (nginx relays a client-supplied value
+            # unless the config overwrites it), so with no XFF the resolver's
+            # X-Real-IP fallback would let every attempt pick a fresh bucket.
+            # Resolve with consult_real_ip=False, as the request log does.
+            if xff and all(v.strip() for v in xff) and _ip_in_networks(
+                peer, _trusted_proxy_networks(include_loopback=False)
+            ):
+                client = ipaddress.ip_address(
+                    _forwarded_client_ip_from_trusted_proxy(handler, consult_real_ip=False)
+                )
                 real_ips = {ipaddress.ip_address(v.strip()) for v in _fields("X-Real-IP")}
-                if all(v.strip() for v in xff) and real_ips <= {client}:
+                if real_ips <= {client}:
                     return str(client)
         except ValueError:
             pass

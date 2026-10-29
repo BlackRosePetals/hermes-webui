@@ -149,8 +149,12 @@ setup that is expected, as the warning itself says. If WebUI listens on IPv6
 Listing a loopback address trusts every local client (an SSH tunnel, another
 process on the host) exactly like the proxy, because the address cannot tell
 them apart. Only do it when the proxy is the sole local client that reaches
-WebUI. Appending to `X-Forwarded-For` (nginx's `$proxy_add_x_forwarded_for`)
-is fine, because WebUI walks the chain from the right. Have the proxy overwrite
+WebUI. Per-client buckets need `X-Forwarded-For`. A request carrying only
+`X-Real-IP` keys on the proxy's shared bucket, because nginx relays a
+client-supplied `X-Real-IP` unless the config overwrites it, and that would let
+a client pick a fresh bucket on every attempt. Appending to `X-Forwarded-For`
+(nginx's `$proxy_add_x_forwarded_for`) is fine, because WebUI walks the chain
+from the right. Have the proxy overwrite
 `X-Real-IP` (`proxy_set_header X-Real-IP $remote_addr;`). If it relays a
 client-supplied value that disagrees with the chain, or one that is not an
 address, WebUI falls back to the shared bucket.

@@ -154,3 +154,40 @@ def test_xff_agreeing_with_real_ip_keeps_per_client_buckets(path, forwarded, rea
     assert _login(path, "10.0.0.5", client) == 429
     other = {"X-Forwarded-For": "203.0.113.20", "X-Real-IP": "203.0.113.20"}
     assert _login(path, "10.0.0.5", other) == 401
+
+
+@pytest.mark.parametrize("path", LOGIN_PATHS)
+@pytest.mark.parametrize(
+    "fields",
+    [
+        # A proxy that forwards no X-Forwarded-For but relays the client's own
+        # X-Real-IP (nginx's default without proxy_set_header X-Real-IP).
+        lambda i: [("X-Real-IP", f"203.0.113.{i}")],
+        lambda i: [("X-Real-IP", f"2001:db8::{i + 1:x}")],
+        # A blank X-Forwarded-For field is not a chain either.
+        lambda i: [("X-Forwarded-For", " "), ("X-Real-IP", f"203.0.113.{i}")],
+    ],
+)
+def test_real_ip_without_xff_keys_on_socket_peer(path, fields, monkeypatch):
+    """Exp-v0.52.546..571 regression: a valid, rotating X-Real-IP with no
+    X-Forwarded-For bought a fresh bucket per attempt (unlimited guesses) where
+    v0.52.544 keyed on the socket peer and returned 429 from attempt 6."""
+    monkeypatch.setenv("HERMES_WEBUI_TRUST_FORWARDED_FOR", "1")
+    monkeypatch.setenv("HERMES_WEBUI_TRUSTED_PROXY_CIDRS", "127.0.0.1/32")
+    for i in range(auth._LOGIN_MAX_ATTEMPTS):
+        assert _login(path, "127.0.0.1", fields(i)) == 401
+
+    assert _login(path, "127.0.0.1", fields(99)) == 429
+
+
+@pytest.mark.parametrize("path", LOGIN_PATHS)
+def test_xff_without_real_ip_keeps_per_client_buckets(path, monkeypatch):
+    """The fix must not cost the XFF-only setup its per-client buckets."""
+    monkeypatch.setenv("HERMES_WEBUI_TRUST_FORWARDED_FOR", "1")
+    monkeypatch.setenv("HERMES_WEBUI_TRUSTED_PROXY_CIDRS", "127.0.0.1/32")
+    client = {"X-Forwarded-For": "1.1.1.1, 203.0.113.10"}
+    for _ in range(auth._LOGIN_MAX_ATTEMPTS):
+        assert _login(path, "127.0.0.1", client) == 401
+
+    assert _login(path, "127.0.0.1", client) == 429
+    assert _login(path, "127.0.0.1", {"X-Forwarded-For": "203.0.113.20"}) == 401

@@ -274,7 +274,10 @@ def test_no_claim_seam_multi_profile_never_repoints_a_shared_instance(
     assert provider.inits == [], "the shared instance must not be initialised without the claim seam"
     assert alpha._memory_manager is None and beta._memory_manager is None
     assert alpha.skip_memory is True and beta.skip_memory is True
-    assert alpha_cacheable is False and beta_cacheable is False
+    # External memory stays off for the life of the process here (the Agent cannot gain
+    # claim_instance and served homes only accumulate), so, like the pre-v0.18 case, the
+    # agent is cacheable: not caching it only rebuilt it on every turn.
+    assert alpha_cacheable is True and beta_cacheable is True
     assert len(_warnings(caplog, "Upgrade the Agent to restore them")) == 1, "warn once per process"
     assert _warnings(caplog, "alpha-session") and _warnings(caplog, "beta-session"), "per-session WARNING"
 
@@ -287,7 +290,7 @@ def test_no_claim_seam_root_with_a_named_profile_fails_closed(hc, homes, root_is
     agent, cacheable = scope_state.construct_profile_scoped_agent(
         make_agent_cls(provider), {"session_id": "root-session"},
         profile_home=str(homes["default"]), session_id="root-session")
-    assert agent._memory_manager is None and cacheable is False and provider.inits == []
+    assert agent._memory_manager is None and cacheable is True and provider.inits == []
 
 
 def test_no_claim_seam_single_profile_root_keeps_external_memory(hc, homes, root_is, scope_state, monkeypatch, caplog):

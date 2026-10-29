@@ -358,19 +358,22 @@ def test_legacy_agent_multi_profile_never_admits_memory_on_an_env_snapshot(
     assert provider.inits == []
     assert cls.turns[0]["agent"]._memory_manager is None
     assert _cached_agent(session_id) is None
-    assert _warnings(caplog, "several profiles")
+    assert _warnings(caplog, "older than v0.18.0")
 
 
-def test_legacy_agent_root_only_install_keeps_memory(legacy_hc, homes, run_turn, scope_state):
-    """No behaviour change for a root-only install on an Agent < v0.18.0."""
+def test_legacy_agent_root_only_install_builds_without_memory(legacy_hc, homes, run_turn, scope_state):
+    """all-r2 finding 1 (behaviour change): a root-only install on an Agent < v0.18.0
+    no longer keeps memory. A later profile (created mid-turn or after the agent was
+    cached) could not be fenced off the env mirror the agent follows."""
     _only_root_profile(homes)
     provider = SharedInstanceMemoryProvider(homes["default"])
     cls = make_agent_cls(provider, bound_scope=False)
     session_id, _events = run_turn(profile=None, agent_cls=cls)
     turn = cls.turns[0]
-    assert turn["agent"]._memory_manager is not None
-    assert turn["cached_agent"] is turn["agent"]
-    assert [r["stamp"] for r in bank_rows(homes["default"])] == [session_id]
+    assert turn["agent"]._memory_manager is None
+    assert turn["cached_agent"] is None
+    assert provider.inits == []
+    assert bank_rows(homes["default"]) == []
 
 
 # ── 4. chat-sync runs the whole turn in the session's profile home ───────────

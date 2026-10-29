@@ -603,12 +603,10 @@ def test_agent_without_bound_scope_keeps_memory_bound_by_the_override(
     assert not bank_rows(homes["beta"])
 
 
-def test_pre_override_agent_single_profile_keeps_memory(legacy_hc, homes, run_turn):
-    """Agent < v0.18.0 (no context-local home): a root-only install keeps memory.
-
-    all-r1: 'root-only' is now checked, not assumed: the homes fixture creates the
-    alpha/beta profile directories, which make this a multi-profile install (memory
-    off on an Agent < v0.18.0), so they are removed first."""
+def test_pre_override_agent_single_profile_runs_without_memory(legacy_hc, homes, run_turn):
+    """Agent < v0.18.0 (no context-local home): even a root-only install runs without
+    memory (all-r2 finding 1: a profile created later, mid-turn or after the agent was
+    cached, cannot be fenced off the env mirror such an agent follows)."""
     for name in ("alpha", "beta"):
         homes[name].rmdir()
     (homes["default"] / "profiles").rmdir()
@@ -618,9 +616,9 @@ def test_pre_override_agent_single_profile_keeps_memory(legacy_hc, homes, run_tu
     session_id, _events = run_turn(profile=None, agent_cls=agent_cls)
 
     turn = agent_cls.turns[0]
-    assert turn["agent"]._memory_manager is not None
-    assert _key(provider.home) == _key(homes["default"])
-    assert turn["cached_agent"] is turn["agent"]
+    assert turn["agent"]._memory_manager is None
+    assert provider.inits == []
+    assert turn["cached_agent"] is None
 
 
 def test_pre_override_agent_with_env_mirror_on_another_profile_fails_closed(

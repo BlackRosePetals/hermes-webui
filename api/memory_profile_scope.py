@@ -122,9 +122,10 @@ _profile_homes_seen_lock = threading.Lock()
 def serves_single_profile(target_key: Optional[str]) -> bool:
     """True only when this WebUI process provably serves ONE profile home.
 
-    Used where per-profile memory isolation cannot be enforced (an Agent without the
-    context-local home override, or without ``claim_instance``): memory stays on only
-    when no other profile can run in this process. Conservative by design; any doubt
+    Used where per-profile memory isolation cannot be enforced (an Agent without
+    ``claim_instance``): external memory stays on only when no other profile can
+    run in this process. (Agents without the context-local home override get no
+    memory at all, see ``_legacy_agent_reason``.) Conservative by design; any doubt
     answers False (memory off), never True:
 
     * ``target_key`` must be the home WebUI's own profile machinery gives the root
@@ -166,6 +167,26 @@ def _noop() -> None:
     return None
 
 
+def _legacy_agent_reason() -> str:
+    """Memory is off on a Hermes Agent < v0.18.0 (#8517 all-r2 finding 1).
+
+    Such an Agent has no context-local home: its external provider binds, and its
+    built-in MEMORY.md / USER.md store reads and writes, whatever the process-wide
+    ``HERMES_HOME`` env mirror names at that instant, for the whole life of the
+    agent. Every WebUI worker for another profile rewrites that mirror. A "only one
+    profile exists" check at construction cannot be fenced against a profile that is
+    created and starts running later (between the check and the bind, during the
+    turn, or after the agent was cached), so it is not an admission either."""
+    _log_once(
+        "legacy-agent",
+        "[webui] #8517: this Hermes Agent has no context-local home override (older than "
+        "v0.18.0), so an agent cannot be held to its own profile's memory. Memory "
+        "(external providers and the built-in MEMORY.md/USER.md) is turned off for every "
+        "agent. Upgrade the Agent to restore it.",
+    )
+    return "this Hermes Agent has no context-local home override (older than v0.18.0)"
+
+
 def _enter_profile_home(profile_home: str, target_key: Optional[str]) -> tuple[Callable[[], None], Optional[str]]:
     """Set the context-local Hermes home to ``profile_home``.
 
@@ -178,36 +199,7 @@ def _enter_profile_home(profile_home: str, target_key: Optional[str]) -> tuple[C
     setter = getattr(mod, "set_hermes_home_override", None) if mod is not None else None
     resetter = getattr(mod, "reset_hermes_home_override", None) if mod is not None else None
     if not (callable(setter) and callable(resetter)):
-        # Hermes Agent < v0.18.0: no context-local home. The Agent can only read the
-        # process env mirror, which any other worker may rewrite between a check here
-        # and the Agent's own read (and again during the turn). An env snapshot is
-        # therefore only an admission when this process provably serves ONE profile
-        # home; with several, memory is off (#8517 all-r1 finding 3).
-        if not serves_single_profile(target_key):
-            _log_once(
-                "legacy-multi",
-                "[webui] #8517: this Hermes Agent has no context-local home override (older "
-                "than v0.18.0) and this WebUI serves several profiles, so an agent cannot be "
-                "held to its own profile's memory. Memory (external providers and the "
-                "built-in MEMORY.md/USER.md) is turned off for every agent. Upgrade the Agent "
-                "to restore it.",
-            )
-            return _noop, (
-                "this Hermes Agent has no context-local home override (older than v0.18.0) "
-                "and this WebUI serves several profiles"
-            )
-        if profile_home_key(os.environ.get("HERMES_HOME")) == target_key:
-            _log_once(
-                "legacy-env",
-                "[webui] #8517: this Hermes Agent has no context-local home override "
-                "(older than v0.18.0); memory providers follow the shared HERMES_HOME. "
-                "Upgrade the Agent for per-profile memory isolation.",
-            )
-            return _noop, None
-        return _noop, (
-            "this Hermes Agent has no context-local home override (older than v0.18.0) "
-            "and the shared HERMES_HOME names another profile"
-        )
+        return _noop, _legacy_agent_reason()
     try:
         token = setter(str(profile_home))
     except Exception as exc:

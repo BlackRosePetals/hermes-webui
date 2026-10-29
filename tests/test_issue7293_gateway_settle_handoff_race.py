@@ -425,7 +425,7 @@ def test_settle_racing_a_reattach_never_settles_the_resumable_run(isolated_sessi
 
 
 @pytest.mark.parametrize("order", ["handoff_first", "settle_first_worker_finalizes", "settle_first_settle_finalizes"])
-def test_lock_busy_settle_fallback_obeys_the_same_either_or(isolated_sessions, monkeypatch, order):
+def test_lock_busy_settle_fallback_obeys_the_same_either_or(isolated_sessions, monkeypatch, order):  # noqa: F811 -- pytest fixture parameter; the module-level import registers the fixture
     """The handoff holds the session lock while it saves, so the settle cannot get it
     and falls back to publishing its cancellation first. The STREAMS_LOCK edge still
     decides: either the durable mark is first (the settle skips) or the cancellation is

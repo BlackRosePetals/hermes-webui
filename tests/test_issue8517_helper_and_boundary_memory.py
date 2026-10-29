@@ -334,7 +334,9 @@ def test_commit_for_provider_bound_to_another_profile_is_not_run(hc, homes, life
     log: list = []
     sid = "issue8517-misbound-alpha"
     misbound = OwnerCheckedAgent(homes["beta"], log)
-    lifecycle.mark_turn_completed(sid, agent=misbound, profile_home=str(homes["alpha"]))
+    # What the streaming turn does after a completed turn.
+    lifecycle.record_owner_profile_home(sid, str(homes["alpha"]))
+    lifecycle.mark_turn_completed(sid, agent=misbound)
 
     with caplog.at_level(logging.WARNING):
         assert lifecycle.commit_session_memory(sid, wait=True) is False
@@ -354,3 +356,18 @@ def test_commit_without_external_memory_is_unchanged(lifecycle):
     lifecycle.mark_turn_completed(sid, agent=PlainAgent())
     assert lifecycle.commit_session_memory(sid, wait=True) is True
     assert PlainAgent.calls == 1 and not lifecycle.has_uncommitted_work(sid)
+
+
+def test_streaming_records_the_owner_before_marking_a_completed_turn():
+    src = (REPO_ROOT / "api" / "streaming.py").read_text(encoding="utf-8")
+    mark = src.index("mark_turn_completed(s.session_id, agent=agent)")
+    record = src.rindex("record_owner_profile_home(s.session_id, _owner_profile_home)", 0, mark)
+    assert mark - record < 200, "the owner must be recorded right before the turn is marked"
+
+
+def test_mark_turn_completed_accepts_the_owner_profile_home(lifecycle, homes):
+    sid = "issue8517-mark-owner"
+    lifecycle.mark_turn_completed(sid, agent=object(), profile_home=str(homes["alpha"]))
+    assert lifecycle.recorded_owner_profile_home(sid) == str(homes["alpha"])
+    lifecycle.record_owner_profile_home(sid, "")
+    assert lifecycle.recorded_owner_profile_home(sid) == str(homes["alpha"]), "empty never clears"

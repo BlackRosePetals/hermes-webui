@@ -188,7 +188,7 @@ def mark_turn_completed(session_id: str, *, agent=None, profile_home: str | None
     with _condition:
         entry = _sessions.setdefault(session_id, _new_entry())
         if profile_home:
-            entry["profile_home"] = str(profile_home)
+            entry["profile_home"] = str(profile_home)  # see record_owner_profile_home
         if agent is not None:
             entry["agent"] = agent
         owner = agent if agent is not None else entry.get("agent")
@@ -201,6 +201,17 @@ def mark_turn_completed(session_id: str, *, agent=None, profile_home: str | None
             segments.append({"start": generation, "end": generation, "agent": owner})
         _condition.notify_all()
         return generation
+
+
+def record_owner_profile_home(session_id: str, profile_home: str | None) -> None:
+    """Record the profile home of the session's owner (#8517); a session's profile
+    never changes, so the latest non-empty value wins."""
+    if not session_id or not profile_home:
+        return
+    with _condition:
+        entry = _sessions.setdefault(session_id, _new_entry())
+        entry["profile_home"] = str(profile_home)
+        _condition.notify_all()
 
 
 def recorded_owner_profile_home(session_id: str) -> str:

@@ -17506,13 +17506,14 @@ def _run_agent_streaming(
                     # in-memory bookkeeping, not provider I/O, so keep it inside the
                     # per-session writeback lock to preserve completed-turn ordering.
                     try:
-                        from api.session_lifecycle import mark_turn_completed
+                        from api.session_lifecycle import mark_turn_completed, record_owner_profile_home
                         try:
                             _owner_profile_home = _profile_home
                         except NameError:
                             _owner_profile_home = ''
                         # #8517: record the owner so boundary commits run as it.
-                        mark_turn_completed(s.session_id, agent=agent, profile_home=_owner_profile_home)
+                        record_owner_profile_home(s.session_id, _owner_profile_home)
+                        mark_turn_completed(s.session_id, agent=agent)
                     except Exception:
                         logger.debug("Memory lifecycle mark failed for session %s", s.session_id, exc_info=True)
                 with _stream_writeback_stage(_writeback_timings, "persistent_state_scan"):

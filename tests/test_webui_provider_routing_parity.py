@@ -304,6 +304,21 @@ def test_chat_sync_agent_routing_is_signature_gated():
         and isinstance(n.func, ast.Name)
         and n.func.id == "AIAgent"
     ]
+    # #8517: the sync agent is built through the profile-scoped constructor,
+    # ``construct_profile_scoped_agent(AIAgent, dict(<kwargs>), ...)``; its
+    # ``dict(...)`` carries the constructor kwargs.
+    agent_calls += [
+        n.args[1] for n in ast.walk(fn)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "construct_profile_scoped_agent"
+        and len(n.args) >= 2
+        and isinstance(n.args[0], ast.Name)
+        and n.args[0].id == "AIAgent"
+        and isinstance(n.args[1], ast.Call)
+        and isinstance(n.args[1].func, ast.Name)
+        and n.args[1].func.id == "dict"
+    ]
     assert agent_calls, "expected an AIAgent(...) construction in _handle_chat_sync"
 
     for call in agent_calls:

@@ -504,9 +504,15 @@ def test_on_a_light_theme_the_ring_is_the_text_accent_and_the_pointer_has_a_wash
     assert ":root:not(.dark) .project-picker-create:focus-visible{opacity:1;}" in STYLE_CSS
     assert ":root:not(.dark) .project-picker-item:hover{background:var(--hover-bg);}" in STYLE_CSS
     # That rule outranks ".project-picker-create:hover", so the row's accent
-    # tint is restated right after it.
-    create = ":root:not(.dark) .project-picker-create:hover{background:var(--accent-bg);}"
+    # tint is restated right after it, in master's OPAQUE form: the row is
+    # sticky and the list scrolls under it, so a bare translucent tint would
+    # let pinned rows show through (#27ad682b9).
+    create = (
+        ":root:not(.dark) .project-picker-create:hover"
+        "{background:linear-gradient(var(--accent-bg),var(--accent-bg)),var(--sidebar);}"
+    )
     assert STYLE_CSS.index(":root:not(.dark) .project-picker-item:hover{") < STYLE_CSS.index(create)
+    assert ".project-picker-create:hover{background:var(--accent-bg);}" not in STYLE_CSS
 
 
 def test_the_menu_that_opens_the_picker_has_finger_tall_rows_on_touch():
@@ -657,10 +663,16 @@ def test_the_touch_that_opened_the_menu_does_not_click_what_is_under_it():
     What a real touch does is in the browser gate."""
     end = SESSIONS_JS.index("    el.addEventListener('touchend',(e)=>{")
     handler = SESSIONS_JS[end : SESSIONS_JS.index("    return el;", end)]
-    cancel = "if(_longPressMenuOpened&&e.cancelable) e.preventDefault();"
+    # Master's handler (#8214) cancels after the gesture finishes, for a tap
+    # handled on the row or a long press that opened the menu; the ⋮ button
+    # returns first because a touch on it begins no row gesture.
+    cancel = "if((tapHandledHere||_longPressMenuOpened)&&e.cancelable){"
+    action_return = "if(_isSessionActionTarget(e.target)) return;"
 
     assert handler.count(cancel) == 1
-    assert handler.index(cancel) < handler.index("_finishSessionGesture(")
+    assert handler.index("_finishSessionGesture(") < handler.index(cancel)
+    assert handler.index(cancel) < handler.index("e.preventDefault();")
+    assert handler.index(action_return) < handler.index("_finishSessionGesture(")
     assert handler.rstrip().endswith("},{passive:false});")
 
 

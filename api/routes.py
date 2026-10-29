@@ -4,6 +4,7 @@ Extracted from server.py (Sprint 11) so server.py is a thin shell.
 """
 
 import html as _html
+import contextlib
 import copy
 import hashlib
 import inspect
@@ -44,6 +45,7 @@ from api.agent_runtime import (
 from api.memory_profile_scope import (
     construct_memoryless_helper_agent,
     construct_profile_scoped_agent,
+    profile_home_turn_scope,
     session_profile_home_or_empty,
 )
 from api.agent_sessions import (
@@ -29993,6 +29995,9 @@ def _handle_chat_sync(handler, body):
         old_session_key = os.environ.get("HERMES_SESSION_KEY")
         os.environ["HERMES_EXEC_ASK"] = "1"
         os.environ["HERMES_SESSION_KEY"] = s.session_id
+    # #8517 all-r1 finding 4: the session's profile home is held from agent
+    # construction through the end of run_conversation (closed in ``finally``).
+    _sync_turn_scope = contextlib.ExitStack()
     try:
         AIAgent = require_ai_agent_class()
 
@@ -30107,6 +30112,16 @@ def _handle_chat_sync(handler, body):
             # #8517: this agent uses memory, so it is built inside the session's own
             # profile home (fails closed to no memory if that cannot be set). The
             # agent is not cached, so the cacheable flag is unused.
+            # all-r1 finding 4: the home stays held for the whole synchronous turn,
+            # not just construction. The Agent's providers check the caller's home on
+            # every hook and the built-in MEMORY.md store resolves the home on every
+            # write, so a turn run after the scope is restored follows the shared env
+            # mirror (another profile after a UI switch). If the home cannot be held
+            # for the turn, the agent is built without memory.
+            _sync_profile_home = session_profile_home_or_empty(s)
+            _sync_turn_scope_reason = _sync_turn_scope.enter_context(
+                profile_home_turn_scope(_sync_profile_home)
+            )
             agent, _ = construct_profile_scoped_agent(
                 AIAgent,
                 dict(
@@ -30123,8 +30138,9 @@ def _handle_chat_sync(handler, body):
                     **_routing_kwargs,
                     **_agent_bundle_kwargs(AIAgent, _bundle),
                 ),
-                profile_home=session_profile_home_or_empty(s),
+                profile_home=_sync_profile_home,
                 session_id=s.session_id,
+                fail_closed_reason=_sync_turn_scope_reason,
             )
             from api.streaming import (
                 _WEBUI_PROGRESS_PROMPT,
@@ -30236,6 +30252,8 @@ def _handle_chat_sync(handler, body):
             )
             result = agent.run_conversation(**_sync_run_kwargs)
     finally:
+        # #8517 all-r1 finding 4: the turn is over; release the session's profile home.
+        _sync_turn_scope.close()
         # Same as the streaming worker's teardown: mirror the workspace into the
         # Agent-created state.db row on every exit, including a raised turn.
         try:

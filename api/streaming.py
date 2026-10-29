@@ -3742,11 +3742,13 @@ def _resolve_streaming_hermes_home_override():
     global _streaming_hermes_home_override_available
     import sys as _sys
 
-    if _streaming_hermes_home_override_available is False:
-        return None
-
+    # #8517 all-r1: a cached negative answer is never trusted. A stale False (an
+    # early failed import, a module swapped later) left the turn-level override
+    # off for the life of the process while construction was still scoped, so
+    # run_conversation, its memory hooks and built-in MEMORY.md writes followed
+    # the shared env mirror (another profile's home). Once loaded this is a dict lookup.
     mod = _sys.modules.get('hermes_constants')
-    if mod is None and _streaming_hermes_home_override_available is None:
+    if mod is None:
         try:
             import hermes_constants  # noqa: F401
             mod = _sys.modules.get('hermes_constants')

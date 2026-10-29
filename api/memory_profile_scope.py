@@ -37,6 +37,7 @@ refused BEFORE ``initialize`` runs and builds without that provider.
 """
 from __future__ import annotations
 
+import contextlib
 import functools
 import importlib
 import inspect
@@ -112,6 +113,55 @@ def session_profile_home_or_empty(session: Any) -> str:
         return ""
 
 
+# Every profile home an old-Agent construction was asked for in this process
+# (see ``serves_single_profile``); never shrinks.
+_profile_homes_seen: set[str] = set()
+_profile_homes_seen_lock = threading.Lock()
+
+
+def serves_single_profile(target_key: Optional[str]) -> bool:
+    """True only when this WebUI process provably serves ONE profile home.
+
+    Used where per-profile memory isolation cannot be enforced (an Agent without the
+    context-local home override, or without ``claim_instance``): memory stays on only
+    when no other profile can run in this process. Conservative by design; any doubt
+    answers False (memory off), never True:
+
+    * ``target_key`` must be the home WebUI's own profile machinery gives the root
+      profile (``api.profiles.get_hermes_home_for_profile(None)``; in isolated
+      profile mode that is the pinned profile, every lookup clamps to it);
+    * that home has no named profile directory (``<root>/profiles/<dir>``); a root
+      session counts as multi-profile as soon as one exists, even an unused one;
+    * no other home was ever requested here (a session whose profile directory
+      does not exist still counts once it was served).
+    """
+    if not target_key:
+        return False
+    with _profile_homes_seen_lock:
+        _profile_homes_seen.add(target_key)
+        if len(_profile_homes_seen) > 1:
+            return False
+    try:
+        from api.profiles import get_hermes_home_for_profile  # noqa: PLC0415
+
+        root = get_hermes_home_for_profile(None)
+    except Exception:
+        logger.debug("[webui] #8517: root profile home unavailable", exc_info=True)
+        return False
+    if not root or profile_home_key(root) != target_key:
+        return False
+    try:
+        for child in (Path(str(root)) / "profiles").iterdir():
+            if child.is_dir():
+                return False
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except Exception:
+        logger.debug("[webui] #8517: cannot list named profiles", exc_info=True)
+        return False
+    return True
+
+
 def _noop() -> None:
     return None
 
@@ -129,8 +179,23 @@ def _enter_profile_home(profile_home: str, target_key: Optional[str]) -> tuple[C
     resetter = getattr(mod, "reset_hermes_home_override", None) if mod is not None else None
     if not (callable(setter) and callable(resetter)):
         # Hermes Agent < v0.18.0: no context-local home. The Agent can only read the
-        # process env mirror, which this turn set to its own home; accept it while it
-        # still names this profile (a single-profile install always does).
+        # process env mirror, which any other worker may rewrite between a check here
+        # and the Agent's own read (and again during the turn). An env snapshot is
+        # therefore only an admission when this process provably serves ONE profile
+        # home; with several, memory is off (#8517 all-r1 finding 3).
+        if not serves_single_profile(target_key):
+            _log_once(
+                "legacy-multi",
+                "[webui] #8517: this Hermes Agent has no context-local home override (older "
+                "than v0.18.0) and this WebUI serves several profiles, so an agent cannot be "
+                "held to its own profile's memory. Memory (external providers and the "
+                "built-in MEMORY.md/USER.md) is turned off for every agent. Upgrade the Agent "
+                "to restore it.",
+            )
+            return _noop, (
+                "this Hermes Agent has no context-local home override (older than v0.18.0) "
+                "and this WebUI serves several profiles"
+            )
         if profile_home_key(os.environ.get("HERMES_HOME")) == target_key:
             _log_once(
                 "legacy-env",
@@ -207,12 +272,60 @@ def _constructor_params(agent_cls: Any) -> set:
         return set()
 
 
-def _build_without_memory(agent_cls: Any, agent_kwargs: dict, params: set) -> Any:
+_BUILTIN_MEMORY_TOOLSET = "memory"
+
+
+def _without_builtin_memory_toolset(kwargs: dict, params: set) -> None:
+    """Make the Agent build no built-in MEMORY.md / USER.md store (#8517 all-r1
+    finding 1). ``skip_memory=True`` only skips EXTERNAL providers: the Agent still
+    loads the built-in store when the ``memory`` toolset is requested
+    (agent/agent_init._init_memory, #65429), and that store reads and writes
+    ``get_hermes_home()/memories``, i.e. whatever home is ambient when it runs.
+
+    * ``memory`` is removed from ``enabled_toolsets`` (Agents 2026-07-22..09-01 only
+      check that list);
+    * ``memory`` is added to ``disabled_toolsets`` when the constructor names it
+      (current Agents: a disabled toolset is not a request, and the tool leaves the
+      model's tool surface).
+    """
+    enabled = kwargs.get("enabled_toolsets")
+    if isinstance(enabled, (list, tuple, set, frozenset)):
+        kwargs["enabled_toolsets"] = [t for t in enabled if t != _BUILTIN_MEMORY_TOOLSET]
+    if "disabled_toolsets" in params:
+        disabled = kwargs.get("disabled_toolsets")
+        disabled = list(disabled) if isinstance(disabled, (list, tuple, set, frozenset)) else []
+        if _BUILTIN_MEMORY_TOOLSET not in disabled:
+            disabled.append(_BUILTIN_MEMORY_TOOLSET)
+        kwargs["disabled_toolsets"] = disabled
+
+
+def _detach_builtin_memory(agent: Any) -> None:
+    """Backstop for an Agent that loaded the built-in store anyway: drop it before
+    any turn reads it into the system prompt or the memory tool writes through it
+    (both look the store up per call and treat ``None`` as memory off)."""
+    if getattr(agent, "_memory_store", None) is None:
+        return
+    try:
+        agent._memory_store = None
+        agent._memory_enabled = False
+        agent._user_profile_enabled = False
+    except Exception as exc:
+        raise RuntimeError("could not drop the built-in memory store from the agent") from exc
+
+
+def _build_without_memory(agent_cls: Any, agent_kwargs: dict, params: set, *, keep_builtin: bool = False) -> Any:
+    """Build with external memory providers off; unless ``keep_builtin``, the
+    built-in MEMORY.md / USER.md store is off too. ``keep_builtin`` is only for
+    callers whose profile home is verifiably held for construction AND the turn."""
     kwargs = dict(agent_kwargs)
     if "skip_memory" in params:
         kwargs["skip_memory"] = True
+    if not keep_builtin:
+        _without_builtin_memory_toolset(kwargs, params)
     agent = agent_cls(**kwargs)
     _detach_memory(agent)
+    if not keep_builtin:
+        _detach_builtin_memory(agent)
     return agent
 
 
@@ -229,7 +342,8 @@ def construct_memoryless_helper_agent(agent_cls: Any, agent_kwargs: dict, *, pur
     ``skip_memory`` is passed only when the constructor names it (Agent
     2026-02-19+; external memory providers arrived later, 2026-04-02, so an
     Agent without the parameter has none). Any manager is still detached. The
-    caller's ``agent_kwargs`` is never mutated.
+    caller's ``agent_kwargs`` is never mutated. The built-in MEMORY.md / USER.md
+    store is off as well (the request thread's ambient home is not the owner's).
     """
     agent = _build_without_memory(agent_cls, agent_kwargs, _constructor_params(agent_cls))
     logger.debug("[webui] built memoryless helper agent for %s", purpose or "helper")
@@ -243,6 +357,7 @@ def construct_profile_scoped_agent(
     profile_home: str,
     agent_params: Optional[set] = None,
     session_id: str = "",
+    fail_closed_reason: str = "",
 ) -> tuple[Any, bool]:
     """Build ``agent_cls(**agent_kwargs)`` for the session whose profile lives at
     ``profile_home`` so its memory provider can only bind that profile.
@@ -250,20 +365,43 @@ def construct_profile_scoped_agent(
     Returns ``(agent, cacheable)``. ``cacheable`` is False when memory was turned
     off or dropped for this turn; the caller must not put that agent in
     SESSION_AGENT_CACHE, so the next turn builds again with memory.
-    ``agent_kwargs`` is never mutated.
+    ``agent_kwargs`` is never mutated. A non-empty ``fail_closed_reason`` (the
+    caller could not hold the profile home for the turn) builds without memory.
+
+    Fail-closed builds turn off the external providers AND the built-in
+    MEMORY.md / USER.md store, except when only the shared-instance guard is
+    missing (old Agent, several profiles): then the profile home is verifiably
+    held, so the built-in store keeps the Agent's own ``skip_memory`` semantics.
     """
-    install_shared_provider_instance_guard()
+    guarded = install_shared_provider_instance_guard()
     params = _constructor_params(agent_cls) if agent_params is None else set(agent_params)
     target_key = profile_home_key(profile_home)
     restore, reason = _enter_profile_home(profile_home, target_key)
     try:
+        if reason is None and fail_closed_reason:
+            reason = fail_closed_reason
+        keep_builtin = False
+        if reason is None and not guarded and not serves_single_profile(target_key):
+            # #8517 all-r1 finding 2: an Agent without ``claim_instance`` initialises a
+            # shared provider instance for every profile that builds an agent, so the
+            # first profile's live agents would follow the last one's bank. Without the
+            # guard, no external provider is initialised in multi-profile operation.
+            _log_once(
+                "no-claim-multi",
+                "[webui] #8517: this Hermes Agent cannot keep a memory provider instance with "
+                "one profile (no claim_instance; older than 2026-10-17) and this WebUI serves "
+                "several profiles, so external memory providers are turned off for every "
+                "agent (built-in memory still works). Upgrade the Agent to restore them.",
+            )
+            reason = "external memory providers are off: Agent without claim_instance and several profiles"
+            keep_builtin = True
         if reason is not None:
             logger.warning(
                 "[webui] #8517: memory provider disabled for session %s this turn: %s "
                 "(profile home %r). The agent is built without memory and not cached.",
                 session_id, reason, profile_home,
             )
-            return _build_without_memory(agent_cls, agent_kwargs, params), False
+            return _build_without_memory(agent_cls, agent_kwargs, params, keep_builtin=keep_builtin), False
         agent = agent_cls(**agent_kwargs)
         state, bound_key = _bound_memory_home_key(agent)
         if state == "bound" and bound_key != target_key:
@@ -273,6 +411,9 @@ def construct_profile_scoped_agent(
                 session_id, bound_key, target_key,
             )
             _detach_memory(agent)
+            # The Agent bound a home other than the one held for it, so its built-in
+            # MEMORY.md / USER.md store cannot be trusted either (all-r1 finding 1).
+            _detach_builtin_memory(agent)
             if "skip_memory" in params:
                 agent = _build_without_memory(agent_cls, agent_kwargs, params)
             return agent, False
@@ -284,6 +425,27 @@ def construct_profile_scoped_agent(
                 "construction. Upgrade the Agent to verify it.",
             )
         return agent, True
+    finally:
+        restore()
+
+
+@contextlib.contextmanager
+def profile_home_turn_scope(profile_home: str):
+    """Hold the context-local Hermes home on ``profile_home`` for a WHOLE turn:
+    construction, ``run_conversation`` and every memory hook it runs (#8517 all-r1
+    finding 4). The Agent's providers check the caller's home on every call, and the
+    built-in MEMORY.md / USER.md store resolves ``get_hermes_home()`` on every write,
+    so a turn that runs after the construction scope is restored meets whatever home
+    the shared env mirror names (another profile after a UI switch).
+
+    Yields ``""`` when the home is held (or, on an Agent < v0.18.0, when memory may
+    run on it at all), else the reason it is not; the caller then builds the agent
+    without memory (``construct_profile_scoped_agent(fail_closed_reason=...)``).
+    Restored on every exit.
+    """
+    restore, reason = _enter_profile_home(profile_home, profile_home_key(profile_home))
+    try:
+        yield reason or ""
     finally:
         restore()
 

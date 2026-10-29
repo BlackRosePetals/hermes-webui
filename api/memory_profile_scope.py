@@ -16,7 +16,9 @@ profile's memory bank, and the agent is then cached for every later turn.
   then answers that home;
 * it fails closed: when the scope cannot be set, the agent is built with memory
   off for that turn (``skip_memory=True``), a WARNING is logged and the caller
-  does not cache it, so the next turn tries again with memory;
+  does not cache it, so the next turn tries again with memory. An Agent with no
+  context-local override at all (< v0.18.0) never gets memory in this process, so
+  that memoryless agent is cached as before;
 * after construction it reads the home the memory manager says it bound
   (``_memory_manager._bound_scope``); on a mismatch it rebuilds the agent
   without memory, warns, and the caller does not cache it.
@@ -167,6 +169,9 @@ def _noop() -> None:
     return None
 
 
+_LEGACY_AGENT_REASON = "this Hermes Agent has no context-local home override (older than v0.18.0)"
+
+
 def _legacy_agent_reason() -> str:
     """Memory is off on a Hermes Agent < v0.18.0 (#8517 all-r2 finding 1).
 
@@ -184,7 +189,7 @@ def _legacy_agent_reason() -> str:
         "(external providers and the built-in MEMORY.md/USER.md) is turned off for every "
         "agent. Upgrade the Agent to restore it.",
     )
-    return "this Hermes Agent has no context-local home override (older than v0.18.0)"
+    return _LEGACY_AGENT_REASON
 
 
 def turn_memory_reason(profile_home: str, *, override_installed: bool) -> str:
@@ -397,7 +402,10 @@ def construct_profile_scoped_agent(
 
     Returns ``(agent, cacheable)``. ``cacheable`` is False when memory was turned
     off or dropped for this turn; the caller must not put that agent in
-    SESSION_AGENT_CACHE, so the next turn builds again with memory.
+    SESSION_AGENT_CACHE, so the next turn builds again with memory. On an Agent
+    without the context-local override (< v0.18.0) memory is off for the life of
+    the process, so no later turn could build it with memory: that memoryless agent
+    is cacheable, as every agent was before #8517.
     ``agent_kwargs`` is never mutated. A non-empty ``fail_closed_reason`` (the
     caller could not hold the profile home for the turn) builds without memory.
 
@@ -410,6 +418,9 @@ def construct_profile_scoped_agent(
     params = _constructor_params(agent_cls) if agent_params is None else set(agent_params)
     target_key = profile_home_key(profile_home)
     restore, reason = _enter_profile_home(profile_home, target_key)
+    # Stable for the process (the Agent has no override API), unlike every other
+    # reason below, which is about this turn only.
+    memory_off_for_process = reason == _LEGACY_AGENT_REASON
     try:
         if reason is None and fail_closed_reason:
             reason = fail_closed_reason
@@ -431,10 +442,12 @@ def construct_profile_scoped_agent(
         if reason is not None:
             logger.warning(
                 "[webui] #8517: memory provider disabled for session %s this turn: %s "
-                "(profile home %r). The agent is built without memory and not cached.",
+                "(profile home %r). The agent is built without memory%s.",
                 session_id, reason, profile_home,
+                "" if memory_off_for_process else " and not cached",
             )
-            return _build_without_memory(agent_cls, agent_kwargs, params, keep_builtin=keep_builtin), False
+            agent = _build_without_memory(agent_cls, agent_kwargs, params, keep_builtin=keep_builtin)
+            return agent, memory_off_for_process
         agent = agent_cls(**agent_kwargs)
         state, bound_key = _bound_memory_home_key(agent)
         if state == "bound" and bound_key != target_key:

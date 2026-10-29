@@ -14568,7 +14568,8 @@ def _run_agent_streaming(
         # MEMORY.md writes). A construction-time scope alone does not cover the turn,
         # and a cached agent runs no constructor at all, so the decision is made once
         # for the whole turn: when the override is not set or not effective, every
-        # construction below builds without memory (not cached) and a memory-enabled
+        # construction below builds without memory (not cached, unless the Agent has
+        # no override at all: construct_profile_scoped_agent) and a memory-enabled
         # cached agent is not reused for this turn.
         _turn_memory_reason = turn_memory_reason(
             _profile_home, override_installed=bool(_streaming_hermes_home_override_ctx[2]),

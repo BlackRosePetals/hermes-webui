@@ -71,6 +71,8 @@
 
 ### Fixed
 
+- **The Tasks panel no longer freezes while a scheduled job runs.** `/api/crons` list, output, history, status and the run, pause, resume, edit and delete actions now read and write the job store through the Agent's per-thread profile overrides instead of waiting on the process-wide cron lock that a running job holds. In a test with a job holding the lock, readers answered in 0.01-0.03 s instead of 11.5-12 s. Creating a job, and edits that pin a model or provider, still wait for the running job, as before, because they read the process environment. Agents without the per-thread store helpers keep the old locked behaviour. Thanks @tobernguyen and @wuliao0066 for the reports. (#8482, fixes #7295, #6753)
+
 - **The model picker takes keyboard focus when it opens.** Opening the composer or Settings model picker now focuses its search box (the list on touch-only devices, so no keyboard pops up), Escape closes only the picker, and focus returns to the chip that opened it. Before, focus stayed on the chip, so typing did nothing and `k` switched the conversation. Thanks @happy5318. (#8445)
 
 - **The workspace file tree works with the keyboard and screen readers.** Its rows are named for screen readers and reachable and operable from the keyboard; before, the Files pane could not be reached by keyboard at all. Thanks @grzezlo, building on @michaldziwisz's #7258. (#8384)

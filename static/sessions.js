@@ -4531,6 +4531,155 @@ function _hasCurrentTailUserDuplicate(messages,candidate){
   return !!(existing&&_sameTranscriptMessage(existing,candidate));
 }
 
+// ── Recovered current-turn prompt: turn ownership, canonical window ────────
+// A `msg_limit` first page is a TAIL window. It can start INSIDE the running
+// turn (the window then carries the turn's activity rows but not its `user`
+// row) or it can end at a PREVIOUS completed turn while the new prompt is still
+// unpersisted (deferred session saving). `_oldestIdx > 0` plus "no user row in
+// the window" cannot tell those apart, so placement follows turn/start
+// ownership instead of the shape of the window:
+//   * a `_live` row always belongs to the running turn;
+//   * a persisted row whose `_ts` is at/after the turn start
+//     (`pending_started_at`, the server's authoritative start of the turn)
+//     belongs to the running turn;
+//   * a persisted row older than that start belongs to an earlier turn.
+// The prompt goes in front of the FIRST current-turn row; when every loaded row
+// predates the turn start (the window is a previous turn's suffix) it goes
+// AFTER them, so earlier activity is never assigned to the new prompt.
+const _RECOVERED_PROMPT_TS_EPSILON=(typeof _PENDING_ACTIVE_TURN_TS_EPSILON==='number'&&_PENDING_ACTIVE_TURN_TS_EPSILON>0)
+  ?_PENDING_ACTIVE_TURN_TS_EPSILON:0.001;
+
+function _messageTimestampValue(msg){
+  if(!msg) return null;
+  const raw=msg._ts!==undefined&&msg._ts!==null?msg._ts:msg.timestamp;
+  const value=Number(raw);
+  return Number.isFinite(value)&&value>0?value:null;
+}
+
+function _messageTurnOwnership(msg,turnStart){
+  if(!msg||msg._displayOnlyRow) return 0;
+  if(msg._live) return 1;
+  const startedAt=Number(turnStart);
+  if(!Number.isFinite(startedAt)||startedAt<=0) return 0;
+  const ts=_messageTimestampValue(msg);
+  if(ts===null) return 0;
+  return ts>=startedAt-_RECOVERED_PROMPT_TS_EPSILON?1:-1;
+}
+
+function _isCompactionMarkerRow(msg){
+  return !!(msg&&typeof _isContextCompactionMessage==='function'&&_isContextCompactionMessage(msg));
+}
+
+// Index of the first PERSISTED row owned by the running turn, judged by the
+// turn-start timestamp. Live rows are skipped (they carry no timestamp and are
+// appended after the window); compaction markers are synthetic user-role rows,
+// not submitted turns. Returns -1 when no persisted row proves ownership.
+function _currentTurnInsertIndex(messages,turnStart){
+  const list=Array.isArray(messages)?messages:[];
+  for(let i=0;i<list.length;i++){
+    const msg=list[i];
+    if(!msg||msg._displayOnlyRow||msg._live||_isCompactionMarkerRow(msg)) continue;
+    if(_messageTurnOwnership(msg,turnStart)>0) return i;
+  }
+  return -1;
+}
+
+// Target index for a recovered prompt inside a windowed transcript.
+//   * authoritative timestamp evidence: in front of the first current-turn row,
+//     or after every row when they ALL predate the turn start (the window is a
+//     previous turn's suffix — the new prompt must not claim that activity);
+//   * no timestamp evidence at all (static partial fixtures, legacy payloads):
+//     keep the historical windowed heuristic — a window with no user row is
+//     assumed to start inside the running turn, otherwise the prompt sits just
+//     before the live tail.
+function _recoveredPromptTargetIndex(messages,turnStart){
+  const list=Array.isArray(messages)?messages:[];
+  const startedAt=Number(turnStart);
+  if(Number.isFinite(startedAt)&&startedAt>0){
+    const ownedIdx=_currentTurnInsertIndex(list,startedAt);
+    if(ownedIdx>=0) return ownedIdx;
+    const sawTimestamped=list.some(m=>m&&!m._displayOnlyRow&&!m._live&&_messageTimestampValue(m)!==null);
+    if(sawTimestamped){
+      const liveIdx=list.findIndex(m=>m&&m._live);
+      return liveIdx>=0?liveIdx:list.length;
+    }
+  }
+  const liveIdx=list.findIndex(m=>m&&m._live);
+  const windowHasUser=list.some(m=>m&&String(m.role||'')==='user'&&!_isCompactionMarkerRow(m));
+  if(windowHasUser) return liveIdx>=0?liveIdx:list.length;
+  return 0;
+}
+
+// Mark a prompt recovered from OUTSIDE the loaded canonical window. The row
+// renders, but `_messageSessionIndexForRawIdx()` excludes it so it never shifts
+// the absolute index of the real window rows.
+function _markRecoveredPromptRow(row){
+  if(!row||typeof row!=='object') return row;
+  if(typeof _markDisplayOnlyRow==='function') return _markDisplayOnlyRow(row);
+  row._displayOnlyRow=true;
+  return row;
+}
+
+// A display-only prompt must disappear once the canonical row it mirrors is
+// actually loaded (older page / full transcript); otherwise it both duplicates
+// the bubble and offsets the window. Matching is by turn identity (server
+// token, `_active_turn_user`, or the turn-start timestamp) — never text alone,
+// which would hide a legitimate repeat prompt.
+function _recoveredPromptIdentityMatch(canonicalRow,recoveredRow){
+  if(!canonicalRow||!recoveredRow) return false;
+  if(canonicalRow._active_turn_user===true) return true;
+  const canonicalTs=_messageTimestampValue(canonicalRow);
+  const recoveredTs=_messageTimestampValue(recoveredRow);
+  if(canonicalTs!==null&&recoveredTs!==null&&Math.abs(canonicalTs-recoveredTs)<=_RECOVERED_PROMPT_TS_EPSILON){
+    return true;
+  }
+  const token=String(canonicalRow._active_turn_token||'');
+  if(token&&typeof _activeTurnTokenMatches==='function'&&typeof S!=='undefined'&&S&&S.session){
+    return _activeTurnTokenMatches(canonicalRow,S.session);
+  }
+  return false;
+}
+
+function _isRecoveredPromptTwin(candidate,recoveredRow){
+  if(!candidate||!recoveredRow) return false;
+  if(candidate===recoveredRow) return true;
+  return String(candidate.role||'')===String(recoveredRow.role||'')
+    && _sameTranscriptMessage(candidate,recoveredRow)
+    && _recoveredPromptIdentityMatch(candidate,recoveredRow);
+}
+
+// Same prompt recovered twice (repeated merge on refresh/reconnect): reuse the
+// row already in the array instead of stacking a second copy above it.
+function _existingRecoveredPromptIndex(messages,pendingMsg){
+  const list=Array.isArray(messages)?messages:[];
+  const sameObject=list.indexOf(pendingMsg);
+  if(sameObject>=0) return sameObject;
+  for(let i=0;i<list.length;i++){
+    const m=list[i];
+    if(!m||!m._displayOnlyRow) continue;
+    if(_sameTranscriptMessage(m,pendingMsg)) return i;
+  }
+  return -1;
+}
+
+// Re-place carried display-only rows after a window rebuild (older page, tail
+// reload) and drop the ones whose canonical row just arrived.
+function _reconcileRecoveredPromptRows(messages,recoveredRows,turnStart){
+  if(!Array.isArray(messages)) return messages;
+  const rows=(Array.isArray(recoveredRows)?recoveredRows:[]).filter(Boolean);
+  if(!rows.length) return messages;
+  const kept=[];
+  for(const row of rows){
+    if(messages.includes(row)) continue;
+    if(messages.some(m=>m&&_isRecoveredPromptTwin(m,row))) continue;
+    kept.push(row);
+  }
+  if(!kept.length) return messages;
+  const target=_recoveredPromptTargetIndex(messages,turnStart);
+  messages.splice(target,0,...kept);
+  return messages;
+}
+
 // Keep pending-user recovery ordering identical across load, reconnect, and
 // explicit refresh paths. The pending prompt owns the live assistant tail and
 // must be projected before it, regardless of which recovery response arrived.
@@ -4541,6 +4690,38 @@ function _mergePendingSessionMessage(session,messages){
   const pendingMsg=typeof getPendingSessionMessage==='function'?getPendingSessionMessage(session,currentTurnMessages):null;
   if(!pendingMsg) return false;
   if(_hasCurrentTailUserDuplicate(currentTurnMessages,pendingMsg)) return false;
+  const windowed=typeof _oldestIdx==='number'&&_oldestIdx>0;
+  if(windowed){
+    // Tail-window transcript: the prompt's canonical position is outside the
+    // loaded window (or not persisted yet), so it is a display-only row placed
+    // by turn ownership. The window rows keep their absolute indices.
+    // `pendingMsg` here is always a FRESH row from getPendingSessionMessage
+    // (the adopt path returns null), and that helper stamps it with
+    // `session.pending_started_at || Date.now()/1000`. Trusting the fallback
+    // makes "now" the turn start, so every loaded row looks older than the
+    // turn and the recovered prompt is pushed past all of them — the reported
+    // "there is content above my first message" order. Only the server-issued
+    // pending_started_at proves turn ownership here; without it pass 0 so
+    // _recoveredPromptTargetIndex falls back to structure (a window carrying
+    // no `user` row means the prompt IS the running turn's first row).
+    const turnStart=Number(session&&session.pending_started_at)||0;
+    const existingIdx=typeof _existingRecoveredPromptIndex==='function'
+      ?_existingRecoveredPromptIndex(messages,pendingMsg)
+      :messages.indexOf(pendingMsg);
+    const withoutExisting=existingIdx>=0?messages.filter((_m,idx)=>idx!==existingIdx):messages;
+    const target=typeof _recoveredPromptTargetIndex==='function'
+      ?_recoveredPromptTargetIndex(withoutExisting,turnStart)
+      :(withoutExisting.some(m=>m&&String(m.role||'')==='user')?withoutExisting.length:0);
+    if(existingIdx>=0){
+      if(existingIdx===target) return false;
+      const [row]=messages.splice(existingIdx,1);
+      messages.splice(target,0,typeof _markRecoveredPromptRow==='function'?_markRecoveredPromptRow(row):row);
+      return true;
+    }
+    const marked=typeof _markRecoveredPromptRow==='function'?_markRecoveredPromptRow(pendingMsg):pendingMsg;
+    messages.splice(target,0,marked);
+    return true;
+  }
   if(liveAssistantIdx>=0){
     const misplacedIdx=messages.findIndex((m,idx)=>
       idx>liveAssistantIdx&&m&&m.role==='user'&&_sameTranscriptMessage(m,pendingMsg)
@@ -4846,13 +5027,67 @@ function _mergeInflightTailMessages(baseMessages, inflightMessages){
   if(firstLiveIdx>0&&inflight[firstLiveIdx-1]&&inflight[firstLiveIdx-1].role==='user') start=firstLiveIdx-1;
   const tail=inflight.slice(start).filter(m=>m&&m.role);
   const merged=[...base];
-  for(const msg of tail){
-    let candidate=msg;
+  const windowed=typeof _oldestIdx==='number'&&_oldestIdx>0;
+  // The live tail starts at the running turn's prompt; any earlier user row in
+  // the tail belongs to a completed turn and must never be re-placed.
+  let promptTailIdx=-1;
+  for(let i=0;i<tail.length;i++){
+    if(tail[i]&&String(tail[i].role||'')==='user') promptTailIdx=i;
+  }
+  for(let tailIdx=0;tailIdx<tail.length;tailIdx++){
+    const candidate=tail[tailIdx];
     if(!candidate) continue;
-    const duplicate=String(candidate.role||'')==='user'
+    const isUser=String(candidate.role||'')==='user';
+    if(isUser&&windowed&&tailIdx===promptTailIdx){
+      // A windowed first page (msg_limit paging) can start INSIDE the running
+      // turn: `base` then holds the turn's activity rows but not its `user`
+      // row. It can also end at a PREVIOUS turn while the new prompt is still
+      // unpersisted (deferred session saving). Turn ownership decides between
+      // the two: the prompt goes in front of the first current-turn row, or
+      // after the window when every loaded row is older than the turn start.
+      const turnStart=_messageTimestampValue(candidate)
+        ||Number(typeof S!=='undefined'&&S&&S.session&&S.session.pending_started_at)||0;
+      const existingIdx=_existingRecoveredPromptIndex(merged,candidate);
+      if(existingIdx>=0){
+        const [existing]=merged.splice(existingIdx,1);
+        merged.splice(_recoveredPromptTargetIndex(merged,turnStart),0,_markRecoveredPromptRow(existing));
+        continue;
+      }
+      if(_hasCurrentTailUserDuplicate(merged,candidate)) continue;
+      merged.splice(_recoveredPromptTargetIndex(merged,turnStart),0,_markRecoveredPromptRow(candidate));
+      continue;
+    }
+    const duplicate=isUser
       ? _hasCurrentTailUserDuplicate(merged,candidate)
       : merged.slice(-Math.max(5,tail.length+2)).some(existing=>_sameTranscriptMessage(existing,candidate));
-    if(!duplicate) merged.push(candidate);
+    if(!duplicate){
+      if(isUser){
+        // Session-switch recovery can hand this merge a base that already
+        // carries the running turn's ACTIVITY rows (assistant prose + tool
+        // rows) while the turn's `user` row is absent — it lives only in the
+        // INFLIGHT snapshot. `push` then parks the question BELOW its own
+        // reply, so the answer renders above the prompt until the turn
+        // settles and an idle reload restores the order. A transcript with no
+        // `user` row at all means this prompt IS the turn's first row, so
+        // place it by turn ownership. (Same structural invariant the windowed
+        // branch above enforces; only the paging condition differed.)
+        const hasAnyUser=merged.some(m=>m&&String(m.role||'')==='user');
+        if(!hasAnyUser){
+          const turnStart=_messageTimestampValue(candidate)
+            ||Number(typeof S!=='undefined'&&S&&S.session&&S.session.pending_started_at)||0;
+          // Marked display-only like the windowed branch: the prompt is NOT in
+          // the server's canonical transcript yet (deferred session saving),
+          // so counting it as a real array member would shift every canonical
+          // index after it — fork/edit/regenerate would send the wrong
+          // keep_count (saved row 0 would look like absolute 1). The marker
+          // keeps `_messageSessionIndexForRawIdx()` excluding the prompt, and
+          // a later canonical reload drops the display copy once it persists.
+          merged.splice(_recoveredPromptTargetIndex(merged,turnStart),0,_markRecoveredPromptRow(candidate));
+          continue;
+        }
+      }
+      merged.push(candidate);
+    }
   }
   return merged;
 }
@@ -4954,7 +5189,12 @@ async function _loadOlderMessages() {
     if (_messagesGeneration !== startGeneration) return;
     let responseSession = data.session;
     let expandedMsgs = (responseSession.messages || []).filter(m => m && m.role);
-    const currentMsgs = (S.messages || []).filter(m => m && m.role);
+    // Recovered prompts are display-only: they are not part of the canonical
+    // window (their absolute index is outside it or not persisted yet), so the
+    // suffix-continuity check, the prepend fallback and the paging cursor all
+    // work on the canonical rows only. They are re-placed after the rebuild.
+    const carriedRecoveredRows = (S.messages || []).filter(m => m && m._displayOnlyRow);
+    const currentMsgs = (S.messages || []).filter(m => m && m.role && !m._displayOnlyRow);
     const currentLen = currentMsgs.length;
     // Suffix-continuity check: the cumulative tail is only safe to wholesale-
     // replace when our currently-displayed messages are still its suffix. If
@@ -4999,7 +5239,7 @@ async function _loadOlderMessages() {
         responseSession = fallback.session;
       }
       olderMsgs = (responseSession.messages || []).filter(m => m && m.role);
-      nextMessages = [...olderMsgs, ...S.messages];
+      nextMessages = [...olderMsgs, ...currentMsgs];
     }
     if (!olderMsgs.length) { _messagesTruncated = !!responseSession._messages_truncated; return; }
     // Replace with the larger tail window and preserve scroll as if older
@@ -5018,6 +5258,17 @@ async function _loadOlderMessages() {
     // does not briefly appear and disappear during older-message expansion.
     if (typeof window._carryForwardEphemeralTurnFields === 'function') {
       nextMessages = window._carryForwardEphemeralTurnFields(S.messages || [], nextMessages);
+    }
+    // Re-place recovered prompts that are still outside the window (or drop
+    // them when the page just loaded the canonical row they mirror). The
+    // canonical rows above keep their absolute indices either way. Guarded for
+    // partial test harnesses that extract this function alone.
+    if (carriedRecoveredRows.length && typeof _reconcileRecoveredPromptRows === 'function') {
+      _reconcileRecoveredPromptRows(
+        nextMessages,
+        carriedRecoveredRows,
+        Number(S.session && S.session.session_id === sid && S.session.pending_started_at) || 0
+      );
     }
     S.messages = nextMessages;
     _syncToolCallsForLoadedMessages(nextMessages, responseSession.tool_calls);
@@ -6052,7 +6303,21 @@ function _sessionActionMenuShouldRepositionOnScroll(target){
 function _positionSessionActionMenu(anchorEl){
   if(!_sessionActionMenu || !anchorEl) return;
   let rect=anchorEl.getBoundingClientRect();
-  if(!rect.width||!rect.height){
+  // A menu opened from `contextmenu` (flagged at open) sits at the pointer the
+  // user invoked it at. The point is the project picker's recorded context
+  // point — the only pointer evidence in this file — and its rowOffsetX/Y keep
+  // the menu glued to the same spot in its row when a sidebar scroll or a
+  // resize repositions it here. The row lookup mirrors _projectPickerAnchorRect,
+  // which stays untouched and keeps owning the zero-sized-anchor fallback.
+  const contextPoint=anchorEl._projectPickerContextPoint;
+  const atPointer=!!(_sessionActionMenu._pointAnchoredFromPointer&&contextPoint&&Number.isFinite(contextPoint.clientX));
+  if(atPointer){
+    const row=anchorEl.closest&&anchorEl.closest('.session-child-session-fork,.session-item');
+    const rowRect=row&&row.isConnected!==false?row.getBoundingClientRect():null;
+    const pointX=rowRect&&Number.isFinite(contextPoint.rowOffsetX)?rowRect.left+contextPoint.rowOffsetX:contextPoint.clientX;
+    const pointY=rowRect&&Number.isFinite(contextPoint.rowOffsetY)?rowRect.top+contextPoint.rowOffsetY:contextPoint.clientY;
+    rect={top:pointY,bottom:pointY+1,left:pointX,right:pointX+1,width:1,height:1,pointAnchored:true};
+  } else if(!rect.width||!rect.height){
     // A zero-sized anchor — coarse-pointer CSS hides `.session-actions`, or a
     // repaint left a stale trigger — borrows the geometry the project picker
     // places from: the recorded context-menu point, else the visible row.
@@ -6638,8 +6903,15 @@ function _openSessionActionMenu(session, anchorEl){
   if(!handoff) return;
   session=handoff.session;
   anchorEl=handoff.anchorEl;
+  // A context-menu point recorded moments ago is fresh evidence of where the
+  // user invoked this menu: _positionSessionActionMenu places it at the
+  // pointer and keeps it glued to that spot in the row. Consuming the flag
+  // anchors the next ⋮-open back on its button.
+  const contextPoint=anchorEl._projectPickerContextPoint;
+  const openAtContextPoint=!!(contextPoint&&contextPoint.freshMenuAnchor);
+  if(contextPoint) delete contextPoint.freshMenuAnchor;
   const isReadOnly = _isReadOnlySession(session);
-  if(_sessionActionMenu && _sessionActionSessionId===session.session_id && _sessionActionAnchor===anchorEl){
+  if(_sessionActionMenu && _sessionActionSessionId===session.session_id && _sessionActionAnchor===anchorEl && !openAtContextPoint){
     closeSessionActionMenu();
     return;
   }
@@ -6654,6 +6926,7 @@ function _openSessionActionMenu(session, anchorEl){
   menu.id='sessionActionMenu-'+(++_sessionActionMenuId);
   menu.setAttribute('role','menu');
   menu.setAttribute('aria-label', 'Conversation actions');
+  menu._pointAnchoredFromPointer=openAtContextPoint;
   _appendSessionCopyLinkAction(menu, session);
   if(isReadOnly){
     _appendSessionExportHtmlAction(menu, session);
@@ -11765,6 +12038,7 @@ async function deleteSession(sid, beforeDelete=null){
       const _tm=$('topbarMeta');if(_tm)_tm.textContent='Start a new conversation';
       $('msgInner').innerHTML='';
       $('emptyState').style.display='';
+      if(typeof a11yTreeReset==='function') a11yTreeReset($('fileTree'), {focusTo: $('workspaceFilesTab')});
       $('fileTree').innerHTML='';
       if(typeof S!=='undefined') S.session=null;
       if(typeof syncAppTitlebar==='function') syncAppTitlebar();
@@ -12516,7 +12790,19 @@ function _positionProjectPicker(picker, anchorEl){
 
 function _recordProjectPickerContextPoint(anchorEl,event){
   if(!anchorEl||!Number.isFinite(event&&event.clientX)||!Number.isFinite(event&&event.clientY)) return;
+  // freshMenuAnchor marks the point as the spot a menu was just invoked from.
+  // _openSessionActionMenu consumes the flag and _positionSessionActionMenu
+  // places a context-menu-opened action menu there (and follows the row).
+  // The point itself is always recorded (the project picker reads it), but only
+  // a pointer right-click on the row is a place to open the menu at. A keyboard
+  // open (Shift+F10 or the ContextMenu key: button -1, fired at the focused
+  // trigger's centre) and a right-click on the trigger itself open on the
+  // button, exactly as a click on it does.
+  const target=event.target;
+  const onTrigger=!!(target&&target.closest&&target.closest('.session-actions-trigger'));
+  const fromKeyboard=event.button<0;
   const point={clientX:event.clientX,clientY:event.clientY};
+  if(!onTrigger&&!fromKeyboard) point.freshMenuAnchor=true;
   const row=anchorEl.closest&&anchorEl.closest('.session-child-session-fork,.session-item');
   if(row&&row.isConnected!==false){
     const rowRect=row.getBoundingClientRect();
@@ -12613,13 +12899,23 @@ function _projectPickerAnchorRect(anchorEl, bounds){
 // Fixed coordinates and getBoundingClientRect use the layout viewport. The
 // visible part can be smaller AND offset (keyboard, browser chrome, zoom).
 function _projectPickerVisibleBounds(){
+  // Validated read (#8531): garbage fold-transition geometry (observed on the
+  // iPhone Duo standalone PWA: height -33554432 = -2^25) must fall back to
+  // window dimensions, not invert the picker's visible bounds. Inlined and
+  // self-contained: this function is extracted into a Node test harness that
+  // does not load boot.js, so it must not reach across files.
   const vv=window.visualViewport;
-  const top=vv?vv.offsetTop:0;
-  const left=vv?vv.offsetLeft:0;
+  const vvOk=vv
+    &&Number.isFinite(Number(vv.height))&&Number(vv.height)>0&&Number(vv.height)<=window.innerHeight*1.5
+    &&Number.isFinite(Number(vv.width))&&Number(vv.width)>0&&Number(vv.width)<=window.innerWidth*1.5
+    ?{height:Number(vv.height),width:Number(vv.width),offsetTop:Math.max(0,Number(vv.offsetTop)||0),offsetLeft:Math.max(0,Number(vv.offsetLeft)||0)}
+    :null;
+  const top=vvOk?vvOk.offsetTop:0;
+  const left=vvOk?vvOk.offsetLeft:0;
   return {
     top,left,
-    bottom:top+(vv?vv.height:window.innerHeight),
-    right:left+(vv?vv.width:window.innerWidth),
+    bottom:top+(vvOk?vvOk.height:window.innerHeight),
+    right:left+(vvOk?vvOk.width:window.innerWidth),
   };
 }
 

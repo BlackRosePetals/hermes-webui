@@ -7432,8 +7432,15 @@ def _forwarded_client_ip_from_trusted_proxy(handler, consult_real_ip: bool = Tru
 def _login_client_ip(handler) -> str:
     """Client IP that the login rate limiter keys on.
 
-    Behind a reverse proxy the raw socket peer is the proxy, so every user
-    would share one bucket. Consult the forwarded chain only when
+    By default this is the raw socket peer, exactly as v0.52.544 keyed it
+    (#8595). Per-client buckets behind a reverse proxy are an explicit opt-in,
+    HERMES_WEBUI_LOGIN_RATE_LIMIT_PER_CLIENT=1, because they rest on a contract
+    the code cannot check: the listed proxy must append to or overwrite
+    X-Forwarded-For. A proxy that relays the client's own header unchanged (a
+    bare nginx proxy_pass) would let every client choose its bucket, and a
+    relayed hop looks exactly like an appended one.
+
+    With the opt-in, the forwarded chain is consulted only when
     HERMES_WEBUI_TRUST_FORWARDED_FOR=1 and the raw peer is listed in
     HERMES_WEBUI_TRUSTED_PROXY_CIDRS. Implicit loopback trust is not enough:
     a direct loopback or SSH-tunnel client could otherwise send a new
@@ -7462,7 +7469,9 @@ def _login_client_ip(handler) -> str:
             single = handler.headers.get(name)
             return [single] if single is not None else []
 
-    if _truthy_env("HERMES_WEBUI_TRUST_FORWARDED_FOR"):
+    if _truthy_env("HERMES_WEBUI_LOGIN_RATE_LIMIT_PER_CLIENT") and _truthy_env(
+        "HERMES_WEBUI_TRUST_FORWARDED_FOR"
+    ):
         try:
             peer = ipaddress.ip_address(_request_client_ip(handler))
             xff = _fields("X-Forwarded-For")
